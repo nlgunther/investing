@@ -16,13 +16,15 @@ from itertools import product
 
 from adjustText import adjust_text
 
-from typing import Any, Generator
+from typing import Any, Generator,NamedTuple
 
 import sec_edgar_downloader
 sec_edgar_downloader.__version__
 # see if namedtuple has "in"
 
-RexGroup = namedtuple('RexGroup', 'rex groupnum'.split())
+class RexGroup(NamedTuple): # for default values
+    rex: str
+    groupnum: int  = 0 
 
 ReportAttributes = namedtuple('ReportAttributes','date type name cik'.split())
 
@@ -45,29 +47,39 @@ class Reports(object):
         try:
             return re.search(rexgroup.rex,text,re.MULTILINE)[rexgroup.groupnum]
         except TypeError as e:
-            msg = f'Problems finding {rexgroup}'
+            msg = f'Problems finding {rexgroup.rex} with group {rexgroup.groupnum}'
             raise TypeError(msg) from e
 
     @classmethod
     def get_locations(kls,reports: list(tuple[Any]),
                      attributerexs: list[RexGroup]) -> list[Location]:
-        locs = []
-        for root,_,fns in reports:
-            for fn in fns:
-                path = os.path.join(root,fn)
-                with open(path) as f:
-                    header = f.read(2000)
-                    attributes = []
-                    for rexgroup in attributerexs:
-                        try:
-                            attributes.append(kls.get_report_attributes(rexgroup,header))
-                        except TypeError as e:
-                            msg = f"Problems with {rexgroup} and {path}"
-                            raise TypeError(msg) from e
-                    try: locs.append(Location(path,ReportAttributes(*attributes)))
-                    except TypeError as e:
-                        print(f"Problem with {rexgroup} and {path}")
-        return locs
+        '''Given a list of file leaves (root,dirs,files) from find_file_leaves
+        and a list of RexGroups, return a list of Locations with the attributes
+        filled in.  Get the locations of the reports with their attributes
+        by reading the first 2000 characters of each file
+        '''
+
+        test = partial(kls.test_rexgroups, attributerexs)
+        return [loc for root,_,fns in reports
+                    for fn in fns
+                        if (loc := test(os.path.join(root,fn)))]
+    
+    @classmethod
+    def test_rexgroups(kls, rexgroups, path):
+        with open(path) as f:
+            header = f.read(2000)
+            attributes = []
+            for rexgroup in rexgroups:
+                try:
+                    attributes.append(kls.get_report_attributes(rexgroup,header))
+                except TypeError as e:
+                    msg = f"Problems with {rexgroup} and {path}"
+                    raise TypeError(msg) from e
+        if attributes:
+            try: 
+                return Location(path,ReportAttributes(*attributes))
+            except TypeError as e:
+                print(f"Problem with {rexgroup} and {path}")
     
     @staticmethod
     def get_location_dict(locs:list[Location],
