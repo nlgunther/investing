@@ -21,10 +21,8 @@ from typing import Any, Generator
 import sec_edgar_downloader
 sec_edgar_downloader.__version__
 # see if namedtuple has "in"
-RexGroup = namedtuple(
-    'RexGroup',
-    'rex groupnum'.split()
-)
+
+RexGroup = namedtuple('RexGroup', 'rex groupnum'.split())
 
 ReportAttributes = namedtuple('ReportAttributes','date type name cik'.split())
 
