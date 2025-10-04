@@ -2,6 +2,7 @@ import os, re, numpy as np,matplotlib.pyplot as plt, pandas as pd,requests
 from collections import defaultdict, namedtuple
 from sec_edgar_downloader import Downloader
 from bs4 import BeautifulSoup as BSP
+import lxml
 from io import StringIO
 
 from functools import partial
@@ -34,52 +35,65 @@ class Reports(object):
 
     @staticmethod
     def find_file_leaves(dr) -> Generator[tuple[Any, list[Any], list[Any]], Any, None]:
-        # a generator to find the files under 
-        #  the top directory skipping
-        #  directories without files
+        '''Given a directory, yield the leaves of the file tree
+        skipping directories without files'''
         for root,drs,fns in os.walk(dr):
             if fns:
                 yield root,drs,fns
 
     @staticmethod
-    def get_report_attributes(rexgroup,text):
-        # search the text for identifying metadata, like date
-        try:
-            return re.search(rexgroup.rex,text,re.MULTILINE)[rexgroup.groupnum]
-        except TypeError as e:
-            msg = f'Problems finding {rexgroup.rex} with group {rexgroup.groupnum}'
-            raise TypeError(msg) from e
+    def search_report_text_for_attributes(rexgroup,text):
+        '''Given a RexGroup and a text, return the attribute
+        found by searching the text with the rex in the RexGroup.
+        This method is a wrapper around re.search()'''
+        m = re.search(rexgroup.rex,text,re.MULTILINE)
+        if m:
+            try:
+                return m[rexgroup.groupnum]
+            except TypeError as e:
+                msg = f'Problems finding {rexgroup.rex} with group {rexgroup.groupnum}'
+                raise TypeError(msg) from e
+    
+    @classmethod
+    def get_report_attributes_from_rexgroups(kls, rexgroups, path,num=-1):
+        '''Given a list of RexGroups and a file path to a report, return 
+         return a list of report attributes by reading the first #num characters
+        of the file and searching for each RegGroup rex'''
+        with open(path) as f:
+            header = f.read(num)
+            attributes = []
+            for rexgroup in rexgroups:
+                try:
+                    attribute = kls.search_report_text_for_attributes(rexgroup,header)
+                    if attribute: attributes.append(attribute)
+                except TypeError as e:
+                    msg = f"Problems with {rexgroup} and {path}"
+                    raise TypeError(msg) from e
+        return attributes
 
     @classmethod
     def get_locations(kls,reports: list(tuple[Any]),
                      attributerexs: list[RexGroup]) -> list[Location]:
         '''Given a list of file leaves (root,dirs,files) from find_file_leaves
-        and a list of RexGroups, return a list of Locations with the attributes
-        filled in.  Get the locations of the reports with their attributes
+        and a list of RexGroups specifying report attributes, return a list of
+        Locations with the attributes filled in.
+        Get the locations of the reports with their attributes
         by reading the first 2000 characters of each file
         '''
 
-        test = partial(kls.test_rexgroups, attributerexs)
+        test = partial(kls.get_locations_from_attribute_rexs, attributerexs)
         return [loc for root,_,fns in reports
                     for fn in fns
                         if (loc := test(os.path.join(root,fn)))]
     
     @classmethod
-    def test_rexgroups(kls, rexgroups, path):
-        with open(path) as f:
-            header = f.read(2000)
-            attributes = []
-            for rexgroup in rexgroups:
-                try:
-                    attributes.append(kls.get_report_attributes(rexgroup,header))
-                except TypeError as e:
-                    msg = f"Problems with {rexgroup} and {path}"
-                    raise TypeError(msg) from e
+    def get_locations_from_attribute_rexs(kls,rexgroups, path):
+        attributes = kls.get_report_attributes_from_rexgroups(rexgroups,path,num=2000)
         if attributes:
             try: 
                 return Location(path,ReportAttributes(*attributes))
             except TypeError as e:
-                print(f"Problem with {rexgroup} and {path}")
+                print(f"Problem with {rexgroup} and {path}: {e}")
     
     @staticmethod
     def get_location_dict(locs:list[Location],
@@ -106,22 +120,73 @@ def get_loc(test,locs, idx = None):
     sel_locs = [loc for loc in locs if test(loc)]
     return sel_locs if idx is None else sel_locs[idx]
 
+class ReportParser(object):
+
+    EXCERPT_LENGTH = 2000
+    delimitertags_rex =  r'(<XML>)|(</XML>)'
+    
+    @staticmethod
+    def read(path):
+        with open(path) as f:
+            text = f.read()
+        return text
+
+    @staticmethod
+    def find_xml(text):
+        xmlintext = list(re.finditer(ReportParser.delimitertags_rex,text))
+        try: 
+            assert (numtags := len(xmlintext)) % 2 == 0
+        except AssertionError as e:
+            msg = f"There are an odd number {numtags} of occurrences matching {ReportParser.delimitertags_rex} in the text"
+            raise AssertionError(msg) from e
+        if numtags > 2:
+            print(f"There are {numtags/2} pairs of tags matching {ReportParser.delimitertags_rex} in the text;taking the last")
+            opentags = [xmlintext[i] for i in range(0,numtags,2)]
+        return [xmlintext[i].span()[j] for i,j in ((-2,0),(-1,1))]
+        '''
+        get final pair - a crude hack.
+        should find the biggest span, or check if a key subtag, such as <informationTable> for
+        hedge funds, exists
+        '''
+        # TODO match even and odd indices and take largest included text; make into its own object
+
+    @classmethod
+    def set_delimitertags_rex(kls,tags):
+        kls.delimitertags_rex = tags
+    
+    def __init__(self,location: Location):
+        self.location = location
+        self.soup = None
+
+    def get_soup(self,return_parser=False):
+        text = self.read(self.location.path) # loose coupling with location object
+        self.start,self.stop = self.find_xml(text)
+        # STORE limited excerpts of the text
+        self.header, self.fund_info = text[:self.start],text[self.start:self.start + self.EXCERPT_LENGTH]
+        soup = BSP(text[self.start:self.stop],'lxml-xml')
+        if return_parser: # wrap Parser around soup to include context data
+            self.soup = soup
+            return self
+        else:
+            return soup
+
+
 class ReportMaker(object):
 
     def __init__(self,positionrex,rowmaker):
         self.positionrex=positionrex
         self.rowmaker = rowmaker
 
-    def make_dataframe_from_parser(self,parser):
+    def make_dataframe_from_parser(self,soup):
         try:
-            nodes = parser.soup.find_all(self.positionrex)
+            nodes = soup.find_all(self.positionrex)
             return pd.DataFrame([self.rowmaker(node) for
                              node in nodes])
         except TypeError as e:
             msg = f'Soup from {parser.location} has problems'
             raise TypeError(msg)
         
-# get_invesco_report_attributes = partial(get_report_attributes,secreportattributes)
+# get_invesco_report_attributes = partial(search_report_text_for_attributes,secreportattributes)
 
 
 hfund_rowmaker = lambda node: dict(
