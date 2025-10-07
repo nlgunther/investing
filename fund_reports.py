@@ -216,16 +216,74 @@ hfundreportmaker = ReportMaker('infoTable',hfund_rowmaker)
 
 #convenience method
 def loc2df(loc: Location,maker) -> pd.DataFrame:
-    return maker.make_dataframe_from_parser(ReportParser(loc).get_soup(True))
+    return maker.make_dataframe_from_parser(ReportParser(loc).get_soup())
 
 def parsers2df(reportmaker,parsers):
     dfs = [reportmaker.make_dataframe_from_parser(parser) for parser in parsers]
     return pd.concat(dfs,keys = [parser.location.attributes.date for parser in parsers])
 
+def no_repeats(s):
+    cs = []
+    no_reps = ''
+    for e in s:
+        if e in cs: continue
+        no_reps+=e
+        cs.append(e)
+    return no_reps    
+
+def remove_vowels_down(s_):
+    s = re.sub(r'inc$|co$|corp$|ltd$|lp$|llc$','',s_.lower())
+    s = re.sub('(?i)[aeiou]','',s)
+    s = re.sub(r'\s+','_',s)
+    s = re.sub(r'\W','',s).strip()
+    s = re.sub(r'([a-zA-Z])\1+', r'\1',s)
+    s = re.sub(r'_+$','',s)
+    return s#no_repeats(s)
+
 clean_df = lambda df: pd.concat([df.query('cusip != "N/A"'),
                                  df.query('cusip == "N/A" and nameOfIssuer != "N/A"')\
-                                    .assign(cusip = 'not_set')])\
+                                    .assign(cusip = df.nameOfIssuer.apply(remove_vowels_down))])\
                                         .drop_duplicates()
 
 config_df = lambda df: df.query("nameOfIssuer != 'N/A' or cusip != 'N/A'")\
     .dropna().sort_values('value')
+
+# Exposure for Hedge Funds with multiple long/short positions in same cusip
+short_str = r'(?i)(\d\.?)+\s*x'
+short_rex = re.compile(r'(?i)(\d\.?)+\s*x')
+is_short = lambda s: short_rex.search(s)
+column_is_short = lambda col: r'%s.str.contains(%s)' % (col,short_rex)
+qShort = r'sign == -1 and putCall=="Put" and %s.str.contains(r"(?i)(\d\.?)+\s*x")' % 'titleOfClass'
+
+class Exposure(object):
+    
+    @staticmethod
+    def get_exposure(df):
+        numdf = df.assign(num = df.titleOfClass.apply(lambda r:float(m[1]) if (m := is_short(r)) else 1))
+        signdf = numdf.assign(sign = numdf.apply(lambda r: (-1 if (short_rex.search(r.titleOfClass) and re.search('(?i)short',r.titleOfClass)) else 1) *  (-1 if (r.putCall and r.putCall.lower() == 'put') else 1),axis=1))
+        # signdf.query('sign == -1 and putCall=="Put" and titleOfClass.str.contains(r"(?i)(\d\.?)+\s*x") ')
+        # signdf.query(qShort)
+        return signdf.assign(mod_value = signdf.value * signdf.num*signdf.sign)
+
+    def __init__(self,df):
+        self.df = df
+        self.df = self.get_exposure(df.copy())
+
+    def aggregate(self):
+        self.df = self.df.groupby('cusip')['mod_value'.split()].sum()
+
+    def get_weights(self):
+        self.df = self.df.assign(weights = self.df.mod_value/self.df.mod_value.abs().sum())
+
+
+def make_comparison_plot(df, x, y, n = 15,fundname = 'Fund', figsize=None,yeqx=False):
+    figsize = (6,6) if figsize is None else figsize
+    fig,ax = plt.subplots(1,1,figsize= figsize)
+    df.iloc[:-n].plot.scatter(x=x,y=y, ax = ax)
+    lims = (-0.003,0.06)
+    df.iloc[-n:].plot.scatter(x=x,y=y,c='red',ax=ax,grid=True, title=f'Most Recent {fundname} Holdings vs Market')
+    if yeqx: ax.plot(lims,lims,c='red')
+    # ax.set_aspect('equal')
+    annotations = [ax.annotate(text,(x,y),size=8) for text,x,y in df.iloc[-n:][('nameOfIssuer %s %s' % (x,y)).split()].values]
+    adjust_text(annotations)
+    return fig,ax
