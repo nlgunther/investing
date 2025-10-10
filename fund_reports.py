@@ -116,10 +116,6 @@ class Reports(object):
         self.locs = self.get_locations(self.reports,attributes)
         self.locd = self.get_location_dict(self.locs,fundnamedict,loc_test)
 
-def get_loc(test,locs, idx = None):
-    sel_locs = [loc for loc in locs if test(loc)]
-    return sel_locs if idx is None else sel_locs[idx]
-
 class ReportParser(object):
 
     EXCERPT_LENGTH = 2000
@@ -214,9 +210,26 @@ mfund_rowmaker = lambda node: dict(
 mfundreportmaker = ReportMaker('invstOrSec',mfund_rowmaker)
 hfundreportmaker = ReportMaker('infoTable',hfund_rowmaker)
 
-#convenience method
+# Convenience methods:
+
+def test4token(df,token,col='nameOfIssuer'):
+    s = "%s.str.contains('(?i)%s')" % (col,token)
+    return df.query(s)
+
+def get_loc(test,locs, idx = None):
+    sel_locs = [loc for loc in locs if test(loc)]
+    return sel_locs if idx is None else sel_locs[idx]
+
 def loc2df(loc: Location,maker) -> pd.DataFrame:
     return maker.make_dataframe_from_parser(ReportParser(loc).get_soup())
+
+get_weights = lambda df: df.assign(weight=df/df.sum())    
+get_weights_drop = lambda df,to_drop='value': get_weights(df).drop(to_drop,axis=1)
+
+def add_active(df):
+    df.fillna(0,inplace=True)
+    df = df.assign(active_weight = df.weight_managed - df.weight)
+    return df.sort_values(df.columns[-1])
 
 def parsers2df(reportmaker,parsers):
     dfs = [reportmaker.make_dataframe_from_parser(parser) for parser in parsers]
@@ -240,10 +253,13 @@ def remove_vowels_down(s_):
     s = re.sub(r'_+$','',s)
     return s#no_repeats(s)
 
-clean_df = lambda df: pd.concat([df.query('cusip != "N/A"'),
-                                 df.query('cusip == "N/A" and nameOfIssuer != "N/A"')\
-                                    .assign(cusip = df.nameOfIssuer.apply(remove_vowels_down))])\
-                                        .drop_duplicates()
+def clean_df(df):
+    good_cusips = df.query(r'cusip.str.contains("\\d")')
+    if not (fixable_cusips := 
+            df.query(r'not cusip.str.contains("\\d",regex=True) and nameOfIssuer.str.contains("\\w",regex=True) and nameOfIssuer != "N/A"')).empty:
+        good_cusips = pd.concat([good_cusips,
+                                 fixable_cusips.assign(cusip = df.nameOfIssuer.apply(remove_vowels_down))])
+    return  good_cusips.drop_duplicates()
 
 config_df = lambda df: df.query("nameOfIssuer != 'N/A' or cusip != 'N/A'")\
     .dropna().sort_values('value')
@@ -256,6 +272,10 @@ column_is_short = lambda col: r'%s.str.contains(%s)' % (col,short_rex)
 qShort = r'sign == -1 and putCall=="Put" and %s.str.contains(r"(?i)(\d\.?)+\s*x")' % 'titleOfClass'
 
 class Exposure(object):
+
+    @staticmethod
+    def aggregate(df,bycol='cusip',sumcols = ['mod_value']):
+        return df.groupby(bycol)[sumcols].sum()
     
     @staticmethod
     def get_exposure(df):
@@ -269,21 +289,79 @@ class Exposure(object):
         self.df = df
         self.df = self.get_exposure(df.copy())
 
-    def aggregate(self):
-        self.df = self.df.groupby('cusip')['mod_value'.split()].sum()
+    def aggregate_df(self,bycol='cusip',sumcols = ['mod_value']):
+        self.df = self.aggregate(self.df,bycol=bycol,sumcols=sumcols)
 
-    def get_weights(self):
-        self.df = self.df.assign(weights = self.df.mod_value/self.df.mod_value.abs().sum())
+    def get_weights(self,drop_value=True):
+        self.df = self.df.assign(weight = self.df.mod_value/self.df.mod_value.abs().sum())
+        if drop_value: 
+            for k in 'value mod_value'.split():
+                if k in self.df.columns:
+                    self.df.drop(k,axis=1,inplace=True)
 
 
-def make_comparison_plot(df, x, y, n = 15,fundname = 'Fund', figsize=None,yeqx=False):
-    figsize = (6,6) if figsize is None else figsize
-    fig,ax = plt.subplots(1,1,figsize= figsize)
+def make_comparison_plot(df, x, y, n = 15,
+                         fundname = 'Fund', figsize=None,
+                         ax = None):
+    if ax is None: # convenience for quick use
+        figsize = (6,6) if figsize is None else figsize
+        fig,ax = plt.subplots(1,1,figsize= figsize)
     df.iloc[:-n].plot.scatter(x=x,y=y, ax = ax)
-    lims = (-0.003,0.06)
     df.iloc[-n:].plot.scatter(x=x,y=y,c='red',ax=ax,grid=True, title=f'Most Recent {fundname} Holdings vs Market')
-    if yeqx: ax.plot(lims,lims,c='red')
-    # ax.set_aspect('equal')
     annotations = [ax.annotate(text,(x,y),size=8) for text,x,y in df.iloc[-n:][('nameOfIssuer %s %s' % (x,y)).split()].values]
-    adjust_text(annotations)
-    return fig,ax
+    adjust_text(annotations, ax=ax)
+    return ax
+
+def make_exposure_dict(dfdict,index='cusip'):
+    expdict = {k:Exposure(v.set_index(index).dropna(how='all')) 
+            for k,v in dfdict.items() if not v.empty}
+    for k,exp in expdict.items():
+        exp.aggregate_df()
+        exp.get_weights()
+    return expdict
+
+def make_active_weight_dict_from_expdict(expdict,basedf, rsuffix = '_managed'):
+    actwtdict = {k:basedf.join(
+        exp.df,rsuffix=rsuffix).pipe(add_active)
+            for k,exp in expdict.items() if not exp.df.empty}
+    return actwtdict
+
+def compare_active_weights(actwtdict,vdf):
+    tempdf = freports.pd.concat([actwtdict[k][['active_weight']] for k in actwtdict.keys()],keys=actwtdict.keys()).unstack(level=0).droplevel(0,axis=1)
+    tempdf = tempdf.assign(agree = tempdf.apply(lambda row: freports.np.sign(row).sum(), axis=1),conviction = tempdf.apply(lambda row: row.mean(),axis=1))
+    return tempdf.sort_values('conviction').join(vdf.set_index('cusip')[['nameOfIssuer']]).dropna()#.query('agree==3').round(4)#.query('nameOfIssuer')
+
+'''
+Run Path
+
+Find all the files in the report directory using Reports.find_file_leaves.
+
+Get the locations of the reports with their attributes using Reports.get_locations
+
+Where needed (Vanguard), refine and filter the locations based on attributes of
+each report using Reports.get_report_attributes_from_rexgroups
+
+Create DataFrames from the soup using ReportMaker.make_dataframe_from_parser
+and ReportParser().get_soup, using the convenience method loc2df().  Can apply this
+to a single location or to a list of locations using a dictionary comprehension with
+location.attributes.name.split()[0].lower() as keys.
+
+If nameofIssuer has "liquidity" and there's no cusip, remove the row via
+df.query(r'not nameOfIssuer.str.contains("(?i)liquidity",regex=True) or cusip.str.contains("\\d",regex=True)').
+(Applies to Vanguard)
+
+Where needed (Vanguard), apply clean_df() to remove rows with no cusip or nameOfIssuer, and to fix
+cusips that are missing.
+
+Where needed for shorts (Renaissance), apply Exposure.get_exposure() to get the exposure
+for each cusip, then apply Exposure.aggregate() to aggregate the exposures by cusip, then
+apply Exposure.get_weights() to get the weights and drop_duplicates() to remove duplicates.
+Implemented through make_exposure_dict() followed by make_active_weight_dict_from_expdict().
+TODO: replace chained function calls with pipe() on underlying dfs.
+Create comparison plots using make_comparison_plot() and comparison analysis using
+compare_active_weights().
+
+
+
+
+'''
