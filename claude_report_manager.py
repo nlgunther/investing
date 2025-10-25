@@ -193,14 +193,17 @@ class SEC13FParser:
                 cik = metadata.get('cik', 'unknown')
                 period_str = metadata.get('periodofreport', 'unknown')
                 
+                print(f"  Parsed metadata - CIK: {cik}, Period string: {period_str}")
+                
                 try:
                     period_date = pd.to_datetime(period_str)
-                except:
+                except Exception as e:
+                    print(f"  Warning: Could not parse date '{period_str}': {e}")
                     period_date = pd.NaT
                 
                 key = (cik, period_date)
                 results[key] = (metadata, holdings)
-                print(f"✓ {filing_dir}: {len(holdings)} holdings")
+                print(f"✓ {filing_dir}: {len(holdings)} holdings (Period: {period_date})")
             except Exception as e:
                 print(f"✗ {filing_dir}: {e}")
         
@@ -348,7 +351,8 @@ def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, 
     
     for key, value in filings_dict.items():
         cik, period_date = key
-        if period_date == target_date:
+        # Compare dates without time component
+        if pd.notna(period_date) and period_date.date() == target_date.date():
             return (key, value)
     
     raise KeyError(f"No filing found for date {date_str}")
@@ -358,7 +362,7 @@ def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, 
 if __name__ == "__main__":
     # Using the high-level manager
     manager = SEC13FManager()
-    filings = manager.download_and_parse("0001037389", num_reports=3)
+    filings = manager.download_and_parse("0001037389", num_reports=5)  # Request 5 to get Q3 2024
     
     # Get specific filing
     try:
