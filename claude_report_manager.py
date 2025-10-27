@@ -1,7 +1,7 @@
 """
-SEC 13-F Filing Downloader and Parser Module
+SEC Filing Downloader and Parser Module
 
-Provides tools to download and parse SEC Form 13-F filings.
+Supports Form 13-F (hedge funds) and Form NPORT-P (mutual funds).
 """
 
 import requests
@@ -13,8 +13,8 @@ import pandas as pd
 from typing import Dict, Tuple, Optional
 
 
-class SEC13FDownloader:
-    """Downloads SEC Form 13-F filings."""
+class SECFilingDownloader:
+    """Downloads SEC filings (13-F, NPORT-P, etc.)."""
     
     def __init__(self, output_dir: str = "sec_filings", user_agent: str = "Research Tool research@example.com"):
         """Initialize downloader.
@@ -28,11 +28,11 @@ class SEC13FDownloader:
         self.headers = {"User-Agent": user_agent}
     
     def download(self, cik: str, form_type: str = "13F-HR", num_reports: int = 5) -> list[str]:
-        """Download the most recent 13-F reports for a specified fund.
+        """Download the most recent filings for a specified entity.
         
         Args:
-            cik: The fund's CIK identifier
-            form_type: The form type to download (default: "13F-HR")
+            cik: The entity's CIK identifier
+            form_type: The form type - "13F-HR", "NPORT-P", etc.
             num_reports: Number of most recent reports to download
         
         Returns:
@@ -43,7 +43,7 @@ class SEC13FDownloader:
         
         # Get company filings metadata
         filings_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        print(f"Fetching filings for CIK {cik}...")
+        print(f"Fetching {form_type} filings for CIK {cik}...")
         
         response = requests.get(filings_url, headers=self.headers)
         response.raise_for_status()
@@ -72,7 +72,7 @@ class SEC13FDownloader:
             filing_dir = self.output_dir / f"{cik}_{accession_no_dash}"
             filing_dir.mkdir(exist_ok=True)
             
-            print(f"\nDownloading filing {filing_date} (Accession: {accession})...")
+            print(f"\nDownloading {form_type} filing {filing_date} (Accession: {accession})...")
             
             archive_base = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession_no_dash}"
             
@@ -131,7 +131,7 @@ class SEC13FDownloader:
         except:
             pass
         
-        # Fallback to common filenames
+        # Fallback to common filenames for both 13-F and NPORT-P
         return ["primary_doc.xml", "form13fInfoTable.xml", "infotable.xml"]
     
     def _download_file(self, url: str, filepath: Path) -> bool:
@@ -146,8 +146,8 @@ class SEC13FDownloader:
         return False
 
 
-class SEC13FParser:
-    """Parses SEC Form 13-F filings."""
+class SECFilingParser:
+    """Parses SEC filings (13-F and NPORT-P)."""
     
     def __init__(self, method: str = 'ET'):
         """Initialize parser.
@@ -158,7 +158,7 @@ class SEC13FParser:
         self.method = method
     
     def parse_filing(self, filing_dir: str) -> Tuple[Dict, pd.DataFrame]:
-        """Parse a single 13-F filing directory.
+        """Parse a single filing directory.
         
         Args:
             filing_dir: Path to filing directory
@@ -170,24 +170,15 @@ class SEC13FParser:
         
         metadata = self._parse_primary_doc(filing_path / "primary_doc.xml")
         
-        holdings_files = list(filing_path.glob("*holding*.xml")) + list(filing_path.glob("infotable.xml"))
+        # Find holdings file (works for both 13-F and NPORT-P)
+        holdings_files = (list(filing_path.glob("*holding*.xml")) + 
+                         list(filing_path.glob("infotable.xml")))
         holdings_df = self._parse_holdings_xml(holdings_files[0]) if holdings_files else pd.DataFrame()
         
         return metadata, holdings_df
     
-    def parse_holdings_file(self, xml_file_path: str) -> pd.DataFrame:
-        """Parse a holdings XML file directly (for testing/debugging).
-        
-        Args:
-            xml_file_path: Direct path to holdings XML file
-            
-        Returns:
-            DataFrame with holdings data
-        """
-        return self._parse_holdings_xml(Path(xml_file_path))
-    
     def parse_multiple(self, filing_dirs: list[str]) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-        """Parse multiple 13-F filings.
+        """Parse multiple filings.
         
         Args:
             filing_dirs: List of filing directory paths
@@ -202,7 +193,10 @@ class SEC13FParser:
                 metadata, holdings = self.parse_filing(filing_dir)
                 
                 cik = metadata.get('cik', 'unknown')
-                period_str = metadata.get('periodofreport', 'unknown')
+                # Try both 13-F and NPORT-P period field names
+                period_str = (metadata.get('periodofreport') or 
+                             metadata.get('reppdend') or 
+                             metadata.get('unknown'))
                 
                 print(f"  Parsed metadata - CIK: {cik}, Period string: {period_str}")
                 
@@ -219,6 +213,17 @@ class SEC13FParser:
                 print(f"✗ {filing_dir}: {e}")
         
         return results
+    
+    def parse_holdings_file(self, xml_file_path: str) -> pd.DataFrame:
+        """Parse a holdings XML file directly (for testing/debugging).
+        
+        Args:
+            xml_file_path: Direct path to holdings XML file
+            
+        Returns:
+            DataFrame with holdings data
+        """
+        return self._parse_holdings_xml(Path(xml_file_path))
     
     def _parse_primary_doc(self, xml_path: Path) -> Dict:
         """Parse primary_doc.xml into a dictionary."""
@@ -249,27 +254,33 @@ class SEC13FParser:
                 
                 # If it's a leaf node (no children), store it with full path
                 if len(child) == 0 and child.text and child.text.strip():
-                    # Create flattened key from path
                     key = '_'.join(current_path).lower()
                     metadata[key] = child.text.strip()
                 else:
-                    # Recurse into children
                     extract_with_path(child, current_path)
         
         extract_with_path(root)
         
         # Add commonly used aliases for backward compatibility
+        # Works for both 13-F and NPORT-P
         if 'headerdata_filerinfo_filer_credentials_cik' in metadata:
             metadata['cik'] = metadata['headerdata_filerinfo_filer_credentials_cik']
         if 'headerdata_filerinfo_periodofreport' in metadata:
             metadata['periodofreport'] = metadata['headerdata_filerinfo_periodofreport']
         if 'formdata_coverpage_filingmanager_name' in metadata:
             metadata['name'] = metadata['formdata_coverpage_filingmanager_name']
+        # NPORT-P specific fields
+        if 'formdata_geninfo_regcik' in metadata:
+            metadata['cik'] = metadata['formdata_geninfo_regcik']
+        if 'formdata_geninfo_reppdend' in metadata:
+            metadata['reppdend'] = metadata['formdata_geninfo_reppdend']
+        if 'formdata_geninfo_regname' in metadata:
+            metadata['name'] = metadata['formdata_geninfo_regname']
         
         return metadata
     
     def _parse_holdings_xml(self, xml_path: Path) -> pd.DataFrame:
-        """Parse holdings XML into a DataFrame."""
+        """Parse holdings XML into a DataFrame (works for 13-F and NPORT-P)."""
         if not xml_path.exists():
             print(f"Warning: Holdings file not found at {xml_path}")
             return pd.DataFrame()
@@ -277,14 +288,18 @@ class SEC13FParser:
         print(f"  Parsing holdings file: {xml_path.name}")
         
         if self.method == 'pandas':
-            try:
-                df = pd.read_xml(xml_path, xpath=".//infoTable")
-            except Exception:
+            # Try different xpath patterns for different filing types
+            for xpath in [".//infoTable", ".//*[local-name()='infoTable']",
+                         ".//invstOrSec", ".//*[local-name()='invstOrSec']"]:
                 try:
-                    df = pd.read_xml(xml_path, xpath=".//*[local-name()='infoTable']")
-                except Exception as e:
-                    print(f"  pandas read_xml failed for holdings: {e}")
-                    return pd.DataFrame()
+                    df = pd.read_xml(xml_path, xpath=xpath)
+                    if not df.empty:
+                        break
+                except:
+                    continue
+            else:
+                print(f"  pandas read_xml failed for holdings")
+                return pd.DataFrame()
         else:
             # Use ET.parse
             tree = ET.parse(xml_path)
@@ -292,19 +307,20 @@ class SEC13FParser:
             
             print(f"  Root tag: {root.tag}")
             
-            # Try multiple xpath patterns
-            info_tables = tree.findall('.//{*}infoTable')
-            if not info_tables:
-                info_tables = tree.findall('.//infoTable')
+            # Try to find holdings elements (13-F uses infoTable, NPORT-P uses invstOrSec)
+            holdings_elements = (tree.findall('.//{*}infoTable') or 
+                               tree.findall('.//infoTable') or
+                               tree.findall('.//{*}invstOrSec') or
+                               tree.findall('.//invstOrSec'))
             
-            if not info_tables:
-                print(f"  No infoTable elements found in {xml_path}")
+            if not holdings_elements:
+                print(f"  No holdings elements found in {xml_path}")
                 return pd.DataFrame()
             
-            print(f"  Found {len(info_tables)} infoTable elements")
+            print(f"  Found {len(holdings_elements)} holding elements")
             
             holdings = []
-            for table in info_tables:
+            for table in holdings_elements:
                 holding = {}
                 
                 # Recursively extract all leaf values with flattened keys
@@ -328,7 +344,7 @@ class SEC13FParser:
                     holdings.append(holding)
             
             if not holdings:
-                print(f"  Warning: No holdings data extracted from {len(info_tables)} infoTable elements")
+                print(f"  Warning: No holdings data extracted")
             
             df = pd.DataFrame(holdings)
         
@@ -337,7 +353,7 @@ class SEC13FParser:
             print(f"  Columns: {', '.join(list(df.columns)[:10])}")
         
         # Convert numeric columns
-        numeric_cols = ['value', 'sshPrnamt', 'sshPrnamtType']
+        numeric_cols = ['value', 'sshPrnamt', 'sshPrnamtType', 'valUSD', 'balance', 'pctVal']
         for col in df.columns:
             if any(nc in col for nc in numeric_cols):
                 try:
@@ -345,38 +361,43 @@ class SEC13FParser:
                 except (ValueError, TypeError):
                     pass
         
-        # Calculate unit value
+        # Calculate unit value for 13-F filings
         if 'value' in df.columns and 'shrsOrPrnAmt_sshPrnamt' in df.columns:
             df = df.assign(unitValue=lambda x: x['value'] / x['shrsOrPrnAmt_sshPrnamt'])
+        # For NPORT-P, use valUSD and balance
+        elif 'valUSD' in df.columns and 'balance' in df.columns:
+            df = df.assign(unitValue=lambda x: x['valUSD'] / x['balance'])
         
         return df
 
 
-class SEC13FManager:
-    """High-level manager for SEC 13-F operations."""
+class SECFilingManager:
+    """High-level manager for SEC filing operations."""
     
-    def __init__(self, output_dir: str = "sec_filings", parse_method: str = 'ET'):
+    def __init__(self, form_type: str = "13F-HR", output_dir: str = "sec_filings", parse_method: str = 'ET'):
         """Initialize manager.
         
         Args:
+            form_type: Form type to download - "13F-HR", "NPORT-P", etc.
             output_dir: Directory for downloaded files
             parse_method: Parsing method - 'ET' or 'pandas'
         """
-        self.downloader = SEC13FDownloader(output_dir)
-        self.parser = SEC13FParser(parse_method)
+        self.form_type = form_type
+        self.downloader = SECFilingDownloader(output_dir)
+        self.parser = SECFilingParser(parse_method)
         self.filings = {}
     
     def download_and_parse(self, cik: str, num_reports: int = 5) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
         """Download and parse filings in one step.
         
         Args:
-            cik: Fund's CIK identifier
+            cik: Entity's CIK identifier
             num_reports: Number of reports to download
             
         Returns:
             Dictionary of parsed filings keyed by (cik, period_date)
         """
-        paths = self.downloader.download(cik, num_reports=num_reports)
+        paths = self.downloader.download(cik, form_type=self.form_type, num_reports=num_reports)
         self.filings = self.parser.parse_multiple(paths)
         return self.filings
     
@@ -388,37 +409,30 @@ class SEC13FManager:
             
         Returns:
             Tuple of (key, value) where key is (cik, period_date) and value is (metadata, holdings)
-            
-        Raises:
-            KeyError: If no filing found for the given date
         """
         target_date = pd.to_datetime(date_str)
         
+        print(f"Searching for date: {target_date}")
+        print(f"Available filings:")
+        for key, _ in self.filings.items():
+            cik, period_date = key
+            print(f"  CIK: {cik}, Date: {period_date}")
+        
         for key, value in self.filings.items():
             cik, period_date = key
-            if period_date == target_date:
+            if pd.notna(period_date) and period_date.date() == target_date.date():
                 return (key, value)
         
         raise KeyError(f"No filing found for date {date_str}")
 
 
-# Convenience function for standalone use
 def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]], 
                        date_str: str) -> Tuple[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-    """Get filing by date string from a filings dictionary.
-    
-    Args:
-        filings_dict: Dictionary returned by parse_multiple_filings
-        date_str: Date string to search for
-        
-    Returns:
-        Tuple of (key, value) where key is (cik, period_date) and value is (metadata, holdings)
-    """
+    """Get filing by date string from a filings dictionary."""
     target_date = pd.to_datetime(date_str)
     
     for key, value in filings_dict.items():
         cik, period_date = key
-        # Compare dates without time component
         if pd.notna(period_date) and period_date.date() == target_date.date():
             return (key, value)
     
@@ -427,49 +441,25 @@ def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, 
 
 # Example usage
 if __name__ == "__main__":
-    # Using the high-level manager with different hedge funds
-    
-    # Example 1: Renaissance Technologies
+    # Example 1: Download 13-F filings for a hedge fund
     print("=" * 60)
-    print("Renaissance Technologies")
+    print("13-F: Renaissance Technologies")
     print("=" * 60)
-    manager_ren = SEC13FManager()
-    filings_ren = manager_ren.download_and_parse("0001037389", num_reports=2)
+    manager_13f = SECFilingManager(form_type="13F-HR")
+    filings_13f = manager_13f.download_and_parse("0001037389", num_reports=2)
     
-    # Example 2: Citadel Advisors
+    # Example 2: Download NPORT-P filings for a mutual fund
     print("\n" + "=" * 60)
-    print("Citadel Advisors")
+    print("NPORT-P: Vanguard Index Funds")
     print("=" * 60)
-    manager_citadel = SEC13FManager()
-    filings_citadel = manager_citadel.download_and_parse("0001423053", num_reports=2)
+    manager_nport = SECFilingManager(form_type="NPORT-P")
+    filings_nport = manager_nport.download_and_parse("0000036405", num_reports=2)
     
-    # Example 3: Bridgewater Associates
-    print("\n" + "=" * 60)
-    print("Bridgewater Associates")
-    print("=" * 60)
-    manager_bridgewater = SEC13FManager()
-    filings_bridgewater = manager_bridgewater.download_and_parse("0001350694", num_reports=2)
-    
-    # Get specific filing from any fund
-    print("\n" + "=" * 60)
-    print("Sample Filing Lookup")
-    print("=" * 60)
-    try:
-        # Get most recent filing from Citadel
-        if filings_citadel:
-            key, (metadata, holdings) = list(filings_citadel.items())[0]
-            cik, period = key
-            print(f"\nCitadel filing for {period.date()}:")
-            print(f"  Name: {metadata.get('name')}")
-            print(f"  Holdings: {len(holdings)}")
-            if 'value' in holdings.columns:
-                print(f"  Total value: ${holdings['value'].sum():,.0f}")
-    except Exception as e:
-        print(f"Error: {e}")
-    
-    # Or use individual components for any CIK
-    # downloader = SEC13FDownloader()
-    # paths = downloader.download("0001423053", num_reports=5)  # Citadel
-    # paths = downloader.download("0001350694", num_reports=5)  # Bridgewater
-    # parser = SEC13FParser(method='ET')
-    # filings = parser.parse_multiple(paths)
+    # Display results
+    if filings_nport:
+        key, (metadata, holdings) = list(filings_nport.items())[0]
+        print(f"\nVanguard filing details:")
+        print(f"  CIK: {key[0]}")
+        print(f"  Period: {key[1]}")
+        print(f"  Fund: {metadata.get('name', 'N/A')}")
+        print(f"  Holdings: {len(holdings)}")
