@@ -170,10 +170,21 @@ class SEC13FParser:
         
         metadata = self._parse_primary_doc(filing_path / "primary_doc.xml")
         
-        holdings_files = list(filing_path.glob("*holding*.xml"))
+        holdings_files = list(filing_path.glob("*holding*.xml")) + list(filing_path.glob("infotable.xml"))
         holdings_df = self._parse_holdings_xml(holdings_files[0]) if holdings_files else pd.DataFrame()
         
         return metadata, holdings_df
+    
+    def parse_holdings_file(self, xml_file_path: str) -> pd.DataFrame:
+        """Parse a holdings XML file directly (for testing/debugging).
+        
+        Args:
+            xml_file_path: Direct path to holdings XML file
+            
+        Returns:
+            DataFrame with holdings data
+        """
+        return self._parse_holdings_xml(Path(xml_file_path))
     
     def parse_multiple(self, filing_dirs: list[str]) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
         """Parse multiple 13-F filings.
@@ -225,20 +236,45 @@ class SEC13FParser:
                 print(f"pandas read_xml failed for primary_doc: {e}")
                 return {}
         
-        # Use ET.parse
+        # Use ET.parse with hierarchical keys
         tree = ET.parse(xml_path)
+        root = tree.getroot()
         metadata = {}
-        for elem in tree.iter():
-            if elem.text and elem.text.strip() and len(elem) == 0:
-                tag = elem.tag.split('}')[-1].lower()
-                metadata[tag] = elem.text.strip()
+        
+        def extract_with_path(element, path=[]):
+            """Recursively extract leaf values with full path as key."""
+            for child in element:
+                tag = child.tag.split('}')[-1]  # Remove namespace
+                current_path = path + [tag]
+                
+                # If it's a leaf node (no children), store it with full path
+                if len(child) == 0 and child.text and child.text.strip():
+                    # Create flattened key from path
+                    key = '_'.join(current_path).lower()
+                    metadata[key] = child.text.strip()
+                else:
+                    # Recurse into children
+                    extract_with_path(child, current_path)
+        
+        extract_with_path(root)
+        
+        # Add commonly used aliases for backward compatibility
+        if 'headerdata_filerinfo_filer_credentials_cik' in metadata:
+            metadata['cik'] = metadata['headerdata_filerinfo_filer_credentials_cik']
+        if 'headerdata_filerinfo_periodofreport' in metadata:
+            metadata['periodofreport'] = metadata['headerdata_filerinfo_periodofreport']
+        if 'formdata_coverpage_filingmanager_name' in metadata:
+            metadata['name'] = metadata['formdata_coverpage_filingmanager_name']
         
         return metadata
     
     def _parse_holdings_xml(self, xml_path: Path) -> pd.DataFrame:
         """Parse holdings XML into a DataFrame."""
         if not xml_path.exists():
+            print(f"Warning: Holdings file not found at {xml_path}")
             return pd.DataFrame()
+        
+        print(f"  Parsing holdings file: {xml_path.name}")
         
         if self.method == 'pandas':
             try:
@@ -247,27 +283,58 @@ class SEC13FParser:
                 try:
                     df = pd.read_xml(xml_path, xpath=".//*[local-name()='infoTable']")
                 except Exception as e:
-                    print(f"pandas read_xml failed for holdings: {e}")
+                    print(f"  pandas read_xml failed for holdings: {e}")
                     return pd.DataFrame()
         else:
             # Use ET.parse
             tree = ET.parse(xml_path)
+            root = tree.getroot()
+            
+            print(f"  Root tag: {root.tag}")
+            
+            # Try multiple xpath patterns
             info_tables = tree.findall('.//{*}infoTable')
+            if not info_tables:
+                info_tables = tree.findall('.//infoTable')
             
             if not info_tables:
-                print(f"No infoTable elements found in {xml_path}")
+                print(f"  No infoTable elements found in {xml_path}")
                 return pd.DataFrame()
+            
+            print(f"  Found {len(info_tables)} infoTable elements")
             
             holdings = []
             for table in info_tables:
                 holding = {}
-                for elem in table.iter():
-                    if elem.text and elem.text.strip() and len(elem) == 0:
-                        tag = elem.tag.split('}')[-1]
-                        holding[tag] = elem.text.strip()
-                holdings.append(holding)
+                
+                # Recursively extract all leaf values with flattened keys
+                def extract_leaf_values(element, prefix=''):
+                    for child in element:
+                        tag = child.tag.split('}')[-1]  # Remove namespace
+                        
+                        # If child has no children, it's a leaf - store its text
+                        if len(child) == 0:
+                            key = f"{prefix}_{tag}" if prefix else tag
+                            if child.text and child.text.strip():
+                                holding[key] = child.text.strip()
+                        else:
+                            # Child has children, recurse with updated prefix
+                            new_prefix = f"{prefix}_{tag}" if prefix else tag
+                            extract_leaf_values(child, new_prefix)
+                
+                extract_leaf_values(table)
+                
+                if holding:
+                    holdings.append(holding)
+            
+            if not holdings:
+                print(f"  Warning: No holdings data extracted from {len(info_tables)} infoTable elements")
             
             df = pd.DataFrame(holdings)
+        
+        print(f"  Extracted {len(df)} holdings with {len(df.columns)} columns")
+        if len(df.columns) > 0:
+            print(f"  Columns: {', '.join(list(df.columns)[:10])}")
         
         # Convert numeric columns
         numeric_cols = ['value', 'sshPrnamt', 'sshPrnamtType']
@@ -279,8 +346,8 @@ class SEC13FParser:
                     pass
         
         # Calculate unit value
-        if 'value' in df.columns and 'sshPrnamt' in df.columns:
-            df = df.assign(unitValue=lambda x: x['value'] / x['sshPrnamt'])
+        if 'value' in df.columns and 'shrsOrPrnAmt_sshPrnamt' in df.columns:
+            df = df.assign(unitValue=lambda x: x['value'] / x['shrsOrPrnAmt_sshPrnamt'])
         
         return df
 
@@ -360,21 +427,49 @@ def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, 
 
 # Example usage
 if __name__ == "__main__":
-    # Using the high-level manager
-    manager = SEC13FManager()
-    filings = manager.download_and_parse("0001037389", num_reports=5)  # Request 5 to get Q3 2024
+    # Using the high-level manager with different hedge funds
     
-    # Get specific filing
+    # Example 1: Renaissance Technologies
+    print("=" * 60)
+    print("Renaissance Technologies")
+    print("=" * 60)
+    manager_ren = SEC13FManager()
+    filings_ren = manager_ren.download_and_parse("0001037389", num_reports=2)
+    
+    # Example 2: Citadel Advisors
+    print("\n" + "=" * 60)
+    print("Citadel Advisors")
+    print("=" * 60)
+    manager_citadel = SEC13FManager()
+    filings_citadel = manager_citadel.download_and_parse("0001423053", num_reports=2)
+    
+    # Example 3: Bridgewater Associates
+    print("\n" + "=" * 60)
+    print("Bridgewater Associates")
+    print("=" * 60)
+    manager_bridgewater = SEC13FManager()
+    filings_bridgewater = manager_bridgewater.download_and_parse("0001350694", num_reports=2)
+    
+    # Get specific filing from any fund
+    print("\n" + "=" * 60)
+    print("Sample Filing Lookup")
+    print("=" * 60)
     try:
-        key, (metadata, holdings) = manager.get_filing_by_date("2024-09-30")
-        print(f"\nFiling for {key[1]}:")
-        print(f"  Name: {metadata.get('name')}")
-        print(f"  Holdings: {len(holdings)}")
-    except KeyError as e:
-        print(e)
+        # Get most recent filing from Citadel
+        if filings_citadel:
+            key, (metadata, holdings) = list(filings_citadel.items())[0]
+            cik, period = key
+            print(f"\nCitadel filing for {period.date()}:")
+            print(f"  Name: {metadata.get('name')}")
+            print(f"  Holdings: {len(holdings)}")
+            if 'value' in holdings.columns:
+                print(f"  Total value: ${holdings['value'].sum():,.0f}")
+    except Exception as e:
+        print(f"Error: {e}")
     
-    # Or use individual components
+    # Or use individual components for any CIK
     # downloader = SEC13FDownloader()
-    # paths = downloader.download("0001037389", num_reports=5)
+    # paths = downloader.download("0001423053", num_reports=5)  # Citadel
+    # paths = downloader.download("0001350694", num_reports=5)  # Bridgewater
     # parser = SEC13FParser(method='ET')
     # filings = parser.parse_multiple(paths)
