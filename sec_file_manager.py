@@ -450,7 +450,7 @@ class FilingNPORTParserStrategy(FilingParserStrategy):
         """Add convenient aliases for NPORT metadata."""
         aliases = {
             'cik': 'headerdata_filerinfo_filer_issuercredentials_cik',
-            'periodofreport': 'formdata_geninfo_reppdend',
+            'periodofreport': 'formdata_geninfo_reppddate',  # Use repPdDate (report date) not repPdEnd
             'name': 'formdata_geninfo_seriesname',
             'seriesid': 'headerdata_filerinfo_seriesclassinfo_seriesid'
         }
@@ -543,14 +543,19 @@ class SECFilingDownloader:
         filing_dir.mkdir(exist_ok=True)
         
         print(f"\nDownloading {filing.filing_date} ({filing.accession_number})...")
+        print(f"  Archive URL: {archive_url}")
         
         files = self.strategy.get_required_files(archive_url)
         downloaded = 0
         
         for filename in files:
-            if self._download_file(f"{archive_url}/{filename}", filing_dir / filename):
-                print(f"  ✓ {filename}")
+            file_url = f"{archive_url}/{filename}"
+            print(f"  Fetching: {file_url}")
+            if self._download_file(file_url, filing_dir / filename):
+                print(f"    ✓ {filename}")
                 downloaded += 1
+            else:
+                print(f"    ✗ {filename} (failed)")
             time.sleep(self.config.request_delay)
         
         return str(filing_dir) if downloaded > 0 else None
@@ -595,9 +600,13 @@ class SECFilingParser:
                 cik = metadata.get('cik', 'unknown')
                 period_str = metadata.get('periodofreport', 'unknown')
                 
+                print(f"  Parsed: CIK={cik}, Period={period_str}, Holdings={len(holdings)}")
+                
                 try:
                     period_date = pd.to_datetime(period_str)
-                except Exception:
+                    print(f"  Date converted to: {period_date}")
+                except Exception as e:
+                    print(f"  Warning: Could not parse date '{period_str}': {e}")
                     period_date = pd.NaT
                 
                 key = (cik, period_date)
