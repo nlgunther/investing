@@ -1,7 +1,21 @@
 """
 SEC Filing Downloader and Parser Module
 
-Improved design with better separation of concerns, testability, and extensibility.
+A flexible, extensible system for downloading and parsing SEC filings.
+Currently supports:
+- 13-F filings (hedge fund holdings)
+- NPORT-P/NPORT-N filings (mutual fund holdings with series filtering)
+
+Architecture:
+- Strategy pattern for different filing types (easy to extend)
+- Composition over inheritance for flexibility
+- Protocol-based HTTP client for testability
+- Centralized configuration and verbosity control
+
+To add a new filing type:
+1. Create DownloaderStrategy subclass
+2. Create ParserStrategy subclass  
+3. Add to SECFilingManager.STRATEGIES registry
 """
 
 import requests
@@ -13,21 +27,55 @@ import pandas as pd
 from typing import Dict, Tuple, Optional, List, Protocol
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from enum import IntEnum
 
 
 # ============================================================================
-# CONFIGURATION
+# CONFIGURATION & VERBOSITY
 # ============================================================================
+
+class VerbosityLevel(IntEnum):
+    """Verbosity levels for output control."""
+    SILENT = 0   # No output
+    ERROR = 1    # Errors only
+    NORMAL = 2   # Standard progress messages
+    VERBOSE = 3  # Detailed information
+    DEBUG = 4    # Debug information including URLs
+
 
 @dataclass
 class SECConfig:
-    """Configuration for SEC API interactions."""
+    """Configuration for SEC API interactions.
+    
+    Attributes:
+        user_agent: User agent string for SEC requests (required by SEC)
+        base_url: Base URL for SEC website
+        data_url: Base URL for SEC data API
+        rate_limit_delay: Delay between filing downloads (seconds)
+        request_delay: Delay between file downloads within a filing (seconds)
+        timeout: HTTP request timeout (seconds)
+        verbosity: Output verbosity level
+    """
     user_agent: str = "Research Tool research@example.com"
     base_url: str = "https://www.sec.gov"
     data_url: str = "https://data.sec.gov"
     rate_limit_delay: float = 0.2
     request_delay: float = 0.1
     timeout: int = 30
+    verbosity: VerbosityLevel = VerbosityLevel.NORMAL
+
+
+def log(message: str, level: VerbosityLevel, config: SECConfig, prefix: str = ""):
+    """Centralized logging function respecting verbosity settings.
+    
+    Args:
+        message: Message to log
+        level: Minimum verbosity level required to show this message
+        config: Configuration containing current verbosity setting
+        prefix: Optional prefix for indentation/formatting
+    """
+    if config.verbosity >= level:
+        print(f"{prefix}{message}")
 
 
 # ============================================================================
@@ -50,28 +98,32 @@ class ParsingError(SECFilingError):
 
 
 # ============================================================================
-# HTTP CLIENT PROTOCOL
+# HTTP CLIENT
 # ============================================================================
 
 class HTTPClient(Protocol):
-    """Protocol for HTTP operations (enables dependency injection)."""
+    """Protocol for HTTP operations.
     
-    def get(self, url: str, timeout: int = 30) -> requests.Response:
-        """Make HTTP GET request."""
-        ...
+    Enables dependency injection for testing without making real HTTP calls.
+    Any class implementing get() can be used as HTTP client.
+    """
+    def get(self, url: str, timeout: int = 30) -> requests.Response: ...
 
 
 class DefaultHTTPClient:
-    """Default HTTP client implementation."""
+    """Default HTTP client implementation using requests library."""
     
     def __init__(self, config: SECConfig):
         self.config = config
         self.headers = {"User-Agent": config.user_agent}
     
     def get(self, url: str, timeout: int = None) -> requests.Response:
-        """Make HTTP GET request with configured headers."""
-        timeout = timeout or self.config.timeout
-        response = requests.get(url, headers=self.headers, timeout=timeout)
+        """Make HTTP GET request with configured headers.
+        
+        Raises:
+            requests.HTTPError: If request fails
+        """
+        response = requests.get(url, headers=self.headers, timeout=timeout or self.config.timeout)
         response.raise_for_status()
         return response
 
@@ -81,48 +133,77 @@ class DefaultHTTPClient:
 # ============================================================================
 
 class XMLParser:
-    """Utility class for XML parsing operations."""
+    """Utility class for XML parsing operations.
+    
+    All methods are static as this is a pure utility class with no state.
+    Handles namespace removal and hierarchical data extraction.
+    """
+    
+    @staticmethod
+    def parse_file(path: Path) -> Optional[ET.Element]:
+        """Parse XML file and remove namespaces.
+        
+        Returns:
+            Root element with namespaces removed, or None if file missing/invalid
+        """
+        if not path.exists():
+            return None
+        try:
+            tree = ET.parse(path)
+            return XMLParser.remove_namespaces(tree.getroot())
+        except ET.ParseError:
+            return None
     
     @staticmethod
     def remove_namespaces(root: ET.Element) -> ET.Element:
-        """Remove XML namespaces from element tree."""
+        """Remove XML namespaces from element tree.
+        
+        SEC XML files use namespaces like xmlns="http://www.sec.gov/edgar/..."
+        This strips them for easier querying.
+        """
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
         return root
     
     @staticmethod
-    def extract_hierarchical_data(root: ET.Element) -> Dict[str, str]:
-        """Extract all leaf node values with hierarchical keys."""
-        data = {}
+    def to_dict(root: ET.Element) -> Dict[str, str]:
+        """Extract all leaf node values with hierarchical keys.
         
+        Converts nested XML like:
+            <parent><child>value</child></parent>
+        To:
+            {'parent_child': 'value'}
+        
+        This flattened structure makes it easy to access values without
+        navigating the XML tree structure.
+        """
+        data = {}
         def traverse(element: ET.Element, path: List[str] = []):
             for child in element:
-                tag = child.tag.split('}')[-1]
-                current_path = path + [tag]
-                
+                tag = child.tag.split('}')[-1]  # Remove namespace if present
+                key = '_'.join(path + [tag]).lower()
                 if len(child) == 0 and child.text and child.text.strip():
-                    key = '_'.join(current_path).lower()
+                    # Leaf node - store the value
                     data[key] = child.text.strip()
                 else:
-                    traverse(child, current_path)
-        
+                    # Branch node - recurse
+                    traverse(child, path + [tag])
         traverse(root)
         return data
     
     @staticmethod
-    def find_elements(root: ET.Element, tag: str) -> List[ET.Element]:
-        """Find all elements with given tag (namespace-agnostic)."""
-        # Try with namespace wildcard
-        elements = root.findall(f'.//{{{root.tag.split("}")[0][1:]}}}{tag}')
-        if not elements:
-            # Try without namespace
-            elements = root.findall(f'.//{tag}')
-        if not elements:
-            # Try with wildcard
-            elements = root.findall(f'.//*')
-            elements = [e for e in elements if e.tag.endswith(tag)]
-        return elements
+    def find_all(root: ET.Element, tag: str) -> List[ET.Element]:
+        """Find all elements with tag (namespace-agnostic).
+        
+        Tries multiple strategies to find elements regardless of namespace:
+        1. Using root's namespace
+        2. Without namespace
+        3. By checking tag endings
+        """
+        return (root.findall(f'.//{{{root.tag.split("}")[0][1:]}}}{tag}') or
+                root.findall(f'.//{tag}') or
+                [e for e in root.findall('.//*') if e.tag.endswith(tag)])
 
 
 # ============================================================================
@@ -130,52 +211,46 @@ class XMLParser:
 # ============================================================================
 
 class FilingFileDiscoverer:
-    """Discovers XML files in SEC filings."""
+    """Discovers XML files in SEC filings.
+    
+    SEC filings can have various XML files. This class tries multiple
+    methods to discover them:
+    1. index.json (structured data)
+    2. index.html (fallback)
+    3. Common filenames (last resort)
+    """
     
     def __init__(self, http_client: HTTPClient, config: SECConfig):
         self.http_client = http_client
         self.config = config
     
-    def discover_xml_files(self, archive_base: str) -> List[str]:
+    def discover(self, archive_url: str) -> List[str]:
         """Discover all XML files in a filing."""
-        # Try index.json first
-        xml_files = self._try_index_json(archive_base)
-        if xml_files:
-            return xml_files
+        log(f"Discovering files at {archive_url}", VerbosityLevel.DEBUG, self.config, "    ")
         
-        # Try index.html
-        xml_files = self._try_index_html(archive_base)
-        if xml_files:
-            return xml_files
-        
-        # Fallback to common names
-        return ["primary_doc.xml", "form13fInfoTable.xml", "infotable.xml"]
+        return (self._try_index_json(archive_url) or
+                self._try_index_html(archive_url) or
+                ["primary_doc.xml", "form13fInfoTable.xml", "infotable.xml"])
     
-    def _try_index_json(self, archive_base: str) -> Optional[List[str]]:
-        """Try to get file list from index.json."""
+    def _try_index_json(self, url: str) -> Optional[List[str]]:
+        """Try to get file list from index.json (preferred method)."""
         try:
-            response = self.http_client.get(f"{archive_base}/index.json")
-            index_data = response.json()
-            return [
-                item['name'] for item in index_data['directory']['item']
-                if item['name'].endswith('.xml')
-            ]
+            data = self.http_client.get(f"{url}/index.json").json()
+            files = [item['name'] for item in data['directory']['item'] if item['name'].endswith('.xml')]
+            log(f"Found {len(files)} XML files via index.json", VerbosityLevel.DEBUG, self.config, "      ")
+            return files
         except:
             return None
     
-    def _try_index_html(self, archive_base: str) -> Optional[List[str]]:
-        """Try to get file list from index.html."""
+    def _try_index_html(self, url: str) -> Optional[List[str]]:
+        """Try to parse file list from index.html (fallback method)."""
         try:
-            response = self.http_client.get(f"{archive_base}/index.html")
-            soup = BeautifulSoup(response.text, 'html.parser')
-            xml_files = []
-            for link in soup.find_all('a'):
-                href = link.get('href', '')
-                if href.endswith('.xml'):
-                    filename = href.split('/')[-1]
-                    if filename not in xml_files:
-                        xml_files.append(filename)
-            return xml_files if xml_files else None
+            soup = BeautifulSoup(self.http_client.get(f"{url}/index.html").text, 'html.parser')
+            files = [link.get('href', '').split('/')[-1] for link in soup.find_all('a')]
+            xml_files = [f for f in files if f.endswith('.xml')]
+            if xml_files:
+                log(f"Found {len(xml_files)} XML files via index.html", VerbosityLevel.DEBUG, self.config, "      ")
+            return xml_files or None
         except:
             return None
 
@@ -186,104 +261,70 @@ class FilingFileDiscoverer:
 
 @dataclass
 class FilingMetadata:
-    """Metadata about a filing."""
-    cik: str
-    accession_number: str
-    filing_date: str
-    form_type: str
+    """Metadata about a single SEC filing.
+    
+    Contains the minimal information needed to identify and download a filing.
+    The archive URL is constructed from these fields.
+    """
+    cik: str                 # Central Index Key (company identifier)
+    accession_number: str    # Unique filing identifier (e.g., "0001037389-24-000123")
+    filing_date: str         # Date filing was submitted to SEC
+    form_type: str           # Type of form (e.g., "13F-HR", "NPORT-P")
     
     @property
     def accession_no_dash(self) -> str:
-        """Accession number without dashes."""
+        """Accession number without dashes (used in URLs)."""
         return self.accession_number.replace("-", "")
     
     def archive_url(self, base_url: str) -> str:
-        """Construct archive URL for this filing."""
+        """Construct SEC archive URL for this filing."""
         return f"{base_url}/Archives/edgar/data/{int(self.cik)}/{self.accession_no_dash}"
 
 
 # ============================================================================
-# DOWNLOADER STRATEGIES
+# STRATEGIES
 # ============================================================================
 
-class FilingDownloaderStrategy(ABC):
-    """Abstract strategy for downloading different filing types."""
+class FilingStrategy(ABC):
+    """Base strategy class providing common functionality.
+    
+    Both downloader and parser strategies inherit from this to get
+    access to HTTP client, config, and XML parser utilities.
+    """
     
     def __init__(self, http_client: HTTPClient, config: SECConfig):
-        self.http_client = http_client
+        self.http = http_client
         self.config = config
+        self.xml = XMLParser()
+
+
+class DownloaderStrategy(FilingStrategy):
+    """Abstract downloader strategy.
+    
+    Subclasses implement specific logic for different filing types:
+    - Which filings to download (filtering logic)
+    - Which files are needed for this filing type
+    """
     
     @abstractmethod
     def should_download(self, filing: FilingMetadata, archive_url: str) -> bool:
-        """Determine if filing should be downloaded."""
+        """Determine if filing should be downloaded (e.g., series filtering)."""
         pass
     
     @abstractmethod
-    def get_required_files(self, archive_url: str) -> List[str]:
+    def get_files(self, archive_url: str) -> List[str]:
         """Get list of required files for this filing type."""
         pass
 
 
-class Filing13FDownloaderStrategy(FilingDownloaderStrategy):
-    """Strategy for downloading 13-F filings."""
+class ParserStrategy(FilingStrategy):
+    """Abstract parser strategy.
     
-    def __init__(self, http_client: HTTPClient, config: SECConfig, 
-                 file_discoverer: FilingFileDiscoverer):
-        super().__init__(http_client, config)
-        self.file_discoverer = file_discoverer
-    
-    def should_download(self, filing: FilingMetadata, archive_url: str) -> bool:
-        """All 13-F filings are downloaded."""
-        return True
-    
-    def get_required_files(self, archive_url: str) -> List[str]:
-        """Discover all XML files for 13-F filing."""
-        return self.file_discoverer.discover_xml_files(archive_url)
-
-
-class FilingNPORTDownloaderStrategy(FilingDownloaderStrategy):
-    """Strategy for downloading NPORT filings with optional series filtering."""
-    
-    def __init__(self, http_client: HTTPClient, config: SECConfig, 
-                 series_id: Optional[str] = None):
-        super().__init__(http_client, config)
-        self.series_id = series_id
-        self.xml_parser = XMLParser()
-    
-    def should_download(self, filing: FilingMetadata, archive_url: str) -> bool:
-        """Check if filing matches series ID filter."""
-        if not self.series_id:
-            return True
-        
-        try:
-            # Fetch primary_doc.xml to check series
-            response = self.http_client.get(f"{archive_url}/primary_doc.xml")
-            root = ET.fromstring(response.content)
-            root = self.xml_parser.remove_namespaces(root)
-            
-            series_elem = root.find('.//seriesId')
-            if series_elem is not None and series_elem.text:
-                return series_elem.text.strip() == self.series_id
-            
-            return False
-        except Exception as e:
-            print(f"  Warning: Could not check series ID: {e}")
-            return False
-    
-    def get_required_files(self, archive_url: str) -> List[str]:
-        """NPORT only needs primary_doc.xml."""
-        return ["primary_doc.xml"]
-
-
-# ============================================================================
-# PARSER STRATEGIES
-# ============================================================================
-
-class FilingParserStrategy(ABC):
-    """Abstract strategy for parsing different filing types."""
-    
-    def __init__(self, xml_parser: XMLParser):
-        self.xml_parser = xml_parser
+    Subclasses implement specific logic for different filing types:
+    - How to extract metadata from primary_doc.xml
+    - Where to find holdings data
+    - How to process holdings into DataFrame
+    """
     
     @abstractmethod
     def parse_metadata(self, xml_path: Path) -> Dict[str, str]:
@@ -292,328 +333,369 @@ class FilingParserStrategy(ABC):
     
     @abstractmethod
     def parse_holdings(self, filing_path: Path) -> pd.DataFrame:
-        """Parse holdings data."""
+        """Parse holdings data into DataFrame."""
         pass
     
     @abstractmethod
-    def add_metadata_aliases(self, metadata: Dict[str, str]) -> Dict[str, str]:
-        """Add convenient aliases to metadata."""
+    def get_aliases(self) -> Dict[str, str]:
+        """Get metadata field aliases (short names for common fields)."""
         pass
-
-
-class Filing13FParserStrategy(FilingParserStrategy):
-    """Strategy for parsing 13-F filings."""
     
-    def parse_metadata(self, xml_path: Path) -> Dict[str, str]:
-        """Parse 13-F primary_doc.xml."""
-        if not xml_path.exists():
-            return {}
+    def _to_numeric(self, df: pd.DataFrame, patterns: List[str]) -> pd.DataFrame:
+        """Convert columns matching patterns to numeric types.
         
-        try:
-            tree = ET.parse(xml_path)
-            root = self.xml_parser.remove_namespaces(tree.getroot())
-            metadata = self.xml_parser.extract_hierarchical_data(root)
-            return self.add_metadata_aliases(metadata)
-        except ET.ParseError as e:
-            raise ParsingError(f"Failed to parse 13-F metadata: {e}")
-    
-    def parse_holdings(self, filing_path: Path) -> pd.DataFrame:
-        """Parse 13-F holdings from separate XML file."""
-        holdings_files = (list(filing_path.glob("*holding*.xml")) + 
-                         list(filing_path.glob("infotable.xml")))
-        
-        if not holdings_files:
-            return pd.DataFrame()
-        
-        return self._parse_holdings_xml(holdings_files[0])
-    
-    def _parse_holdings_xml(self, xml_path: Path) -> pd.DataFrame:
-        """Parse 13-F holdings XML file."""
-        try:
-            tree = ET.parse(xml_path)
-            root = self.xml_parser.remove_namespaces(tree.getroot())
-            info_tables = self.xml_parser.find_elements(root, 'infoTable')
-            
-            if not info_tables:
-                return pd.DataFrame()
-            
-            holdings = []
-            for table in info_tables:
-                holding = self.xml_parser.extract_hierarchical_data(table)
-                if holding:
-                    holdings.append(holding)
-            
-            df = pd.DataFrame(holdings)
-            return self._post_process_holdings(df)
-        except Exception as e:
-            raise ParsingError(f"Failed to parse 13-F holdings: {e}")
-    
-    def _post_process_holdings(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convert numeric columns and calculate derived values."""
-        if df.empty:
-            return df
-        
-        # Convert numeric columns
+        Shared utility method for all parsers. Silently ignores conversion errors.
+        """
         for col in df.columns:
-            if any(nc in col for nc in ['value', 'sshprnamt']):
+            if any(p in col for p in patterns):
                 try:
                     df[col] = pd.to_numeric(df[col])
                 except (ValueError, TypeError):
-                    pass
+                    pass  # Keep as string if conversion fails
+        return df
+
+
+# ============================================================================
+# 13-F STRATEGIES
+# ============================================================================
+
+class Filing13FDownloader(DownloaderStrategy):
+    """Downloads 13-F filings (hedge fund holdings).
+    
+    13-F filings report quarterly holdings for institutional investment managers
+    with over $100M in assets. No filtering is applied - all 13-F filings
+    for a CIK are downloaded.
+    """
+    
+    def __init__(self, http_client: HTTPClient, config: SECConfig):
+        super().__init__(http_client, config)
+        self.discoverer = FilingFileDiscoverer(http_client, config)
+    
+    def should_download(self, filing: FilingMetadata, archive_url: str) -> bool:
+        """Download all 13-F filings (no filtering)."""
+        return True
+    
+    def get_files(self, archive_url: str) -> List[str]:
+        """Discover all XML files (13-F has separate holdings file)."""
+        return self.discoverer.discover(archive_url)
+
+
+class Filing13FParser(ParserStrategy):
+    """Parses 13-F filings.
+    
+    13-F structure:
+    - primary_doc.xml: Metadata (filer info, period, etc.)
+    - *_holdings.xml or infotable.xml: Holdings data (one infoTable per holding)
+    """
+    
+    def parse_metadata(self, xml_path: Path) -> Dict[str, str]:
+        """Extract metadata from primary_doc.xml."""
+        root = self.xml.parse_file(xml_path)
+        if not root:
+            return {}
         
-        # Calculate unit value
+        metadata = self.xml.to_dict(root)
+        # Add convenient aliases for commonly used fields
+        return {**metadata, **{alias: metadata.get(key, '') for alias, key in self.get_aliases().items()}}
+    
+    def parse_holdings(self, filing_path: Path) -> pd.DataFrame:
+        """Parse holdings from separate holdings XML file.
+        
+        Searches for files with 'holding' in name or named 'infotable.xml'.
+        Each <infoTable> element represents one holding.
+        """
+        # Find holdings file (naming varies by filer)
+        holdings_file = next((f for f in filing_path.glob("*") 
+                             if 'holding' in f.name.lower() or f.name == 'infotable.xml'), None)
+        if not holdings_file:
+            log("No holdings file found", VerbosityLevel.VERBOSE, self.config, "    ")
+            return pd.DataFrame()
+        
+        root = self.xml.parse_file(holdings_file)
+        if not root:
+            return pd.DataFrame()
+        
+        # Extract all infoTable elements (one per holding)
+        holdings = [self.xml.to_dict(table) for table in self.xml.find_all(root, 'infoTable')]
+        if not holdings:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(holdings)
+        df = self._to_numeric(df, ['value', 'sshprnamt'])
+        
+        # Calculate unit value (price per share) if possible
         if 'value' in df.columns and 'shrsorprnamt_sshprnamt' in df.columns:
             df = df.assign(unitValue=lambda x: x['value'] / x['shrsorprnamt_sshprnamt'])
         
         return df
     
-    def add_metadata_aliases(self, metadata: Dict[str, str]) -> Dict[str, str]:
-        """Add convenient aliases for 13-F metadata."""
-        aliases = {
+    def get_aliases(self) -> Dict[str, str]:
+        """Map short names to full hierarchical keys for 13-F metadata."""
+        return {
             'cik': 'headerdata_filerinfo_filer_credentials_cik',
             'periodofreport': 'headerdata_filerinfo_periodofreport',
             'name': 'formdata_coverpage_filingmanager_name'
         }
-        
-        for alias, full_key in aliases.items():
-            if full_key in metadata:
-                metadata[alias] = metadata[full_key]
-        
-        return metadata
 
 
-class FilingNPORTParserStrategy(FilingParserStrategy):
-    """Strategy for parsing NPORT filings."""
+# ============================================================================
+# NPORT STRATEGIES
+# ============================================================================
+
+class FilingNPORTDownloader(DownloaderStrategy):
+    """Downloads NPORT filings (mutual fund holdings) with series filtering.
+    
+    NPORT-P filings report monthly holdings for registered investment companies
+    (mutual funds). A single CIK can have multiple series (different funds),
+    so we support filtering by series ID.
+    """
+    
+    def __init__(self, http_client: HTTPClient, config: SECConfig, series_id: Optional[str] = None):
+        super().__init__(http_client, config)
+        self.series_id = series_id
+    
+    def should_download(self, filing: FilingMetadata, archive_url: str) -> bool:
+        """Check if filing matches series ID filter.
+        
+        If no series_id specified, download all filings.
+        Otherwise, fetch primary_doc.xml and check the series ID.
+        """
+        if not self.series_id:
+            return True
+        
+        log(f"Checking series ID for {filing.accession_number}", VerbosityLevel.DEBUG, self.config, "    ")
+        
+        try:
+            # Fetch primary_doc.xml to check series
+            response = self.http.get(f"{archive_url}/primary_doc.xml")
+            root = ET.fromstring(response.content)
+            root = self.xml.remove_namespaces(root)
+            
+            series_elem = root.find('.//seriesId')
+            if series_elem is not None and series_elem.text:
+                matches = series_elem.text.strip() == self.series_id
+                log(f"Series ID {series_elem.text.strip()} {'matches' if matches else 'does not match'}", 
+                    VerbosityLevel.DEBUG, self.config, "      ")
+                return matches
+            
+            return False
+        except Exception as e:
+            log(f"Warning: Could not check series ID: {e}", VerbosityLevel.VERBOSE, self.config, "    ")
+            return False
+    
+    def get_files(self, archive_url: str) -> List[str]:
+        """NPORT uses single file (primary_doc.xml contains everything)."""
+        return ["primary_doc.xml"]
+
+
+class FilingNPORTParser(ParserStrategy):
+    """Parses NPORT filings.
+    
+    NPORT structure (single file):
+    - primary_doc.xml contains both metadata and holdings
+    - Metadata in <headerData> and <genInfo> sections
+    - Holdings in <invstOrSecs> section (one <invstOrSec> per holding)
+    """
     
     def parse_metadata(self, xml_path: Path) -> Dict[str, str]:
-        """Parse NPORT primary_doc.xml."""
-        if not xml_path.exists():
+        """Extract metadata from primary_doc.xml."""
+        root = self.xml.parse_file(xml_path)
+        if not root:
             return {}
         
-        try:
-            tree = ET.parse(xml_path)
-            root = self.xml_parser.remove_namespaces(tree.getroot())
-            metadata = self.xml_parser.extract_hierarchical_data(root)
-            return self.add_metadata_aliases(metadata)
-        except ET.ParseError as e:
-            raise ParsingError(f"Failed to parse NPORT metadata: {e}")
+        metadata = self.xml.to_dict(root)
+        # Add convenient aliases
+        return {**metadata, **{alias: metadata.get(key, '') for alias, key in self.get_aliases().items()}}
     
     def parse_holdings(self, filing_path: Path) -> pd.DataFrame:
-        """Parse NPORT holdings from primary_doc.xml."""
-        xml_path = filing_path / "primary_doc.xml"
-        if not xml_path.exists():
+        """Parse holdings from primary_doc.xml (single file structure).
+        
+        Each <invstOrSec> element represents one security holding.
+        """
+        root = self.xml.parse_file(filing_path / "primary_doc.xml")
+        if not root:
             return pd.DataFrame()
         
-        return self._parse_holdings_from_primary(xml_path)
-    
-    def _parse_holdings_from_primary(self, xml_path: Path) -> pd.DataFrame:
-        """Parse NPORT holdings from single file."""
-        try:
-            tree = ET.parse(xml_path)
-            root = self.xml_parser.remove_namespaces(tree.getroot())
-            holdings_elements = self.xml_parser.find_elements(root, 'invstOrSec')
-            
-            if not holdings_elements:
-                return pd.DataFrame()
-            
-            holdings = []
-            for sec in holdings_elements:
-                holding = self.xml_parser.extract_hierarchical_data(sec)
-                if holding:
-                    holdings.append(holding)
-            
-            df = pd.DataFrame(holdings)
-            return self._post_process_holdings(df)
-        except Exception as e:
-            raise ParsingError(f"Failed to parse NPORT holdings: {e}")
-    
-    def _post_process_holdings(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convert numeric columns and calculate derived values."""
-        if df.empty:
-            return df
+        # Extract all invstOrSec elements
+        holdings = [self.xml.to_dict(sec) for sec in self.xml.find_all(root, 'invstOrSec')]
+        if not holdings:
+            log("No holdings found in invstOrSecs section", VerbosityLevel.VERBOSE, self.config, "    ")
+            return pd.DataFrame()
         
-        # Convert numeric columns
-        for col in df.columns:
-            if any(nc in col for nc in ['valusd', 'balance', 'pctval']):
-                try:
-                    df[col] = pd.to_numeric(df[col])
-                except (ValueError, TypeError):
-                    pass
+        df = pd.DataFrame(holdings)
+        df = self._to_numeric(df, ['valusd', 'balance', 'pctval'])
         
-        # Calculate unit value
+        # Calculate unit value (price per unit) if possible
         if 'valusd' in df.columns and 'balance' in df.columns:
             df = df.assign(unitValue=lambda x: x['valusd'] / x['balance'])
         
         return df
     
-    def add_metadata_aliases(self, metadata: Dict[str, str]) -> Dict[str, str]:
-        """Add convenient aliases for NPORT metadata."""
-        aliases = {
+    def get_aliases(self) -> Dict[str, str]:
+        """Map short names to full hierarchical keys for NPORT metadata."""
+        return {
             'cik': 'headerdata_filerinfo_filer_issuercredentials_cik',
-            'periodofreport': 'formdata_geninfo_reppddate',  # Use repPdDate (report date) not repPdEnd
+            'periodofreport': 'formdata_geninfo_reppddate',  # Report date, not period end
             'name': 'formdata_geninfo_seriesname',
             'seriesid': 'headerdata_filerinfo_seriesclassinfo_seriesid'
         }
-        
-        for alias, full_key in aliases.items():
-            if full_key in metadata:
-                metadata[alias] = metadata[full_key]
-        
-        return metadata
 
 
 # ============================================================================
-# DOWNLOADER
+# DOWNLOADER & PARSER
 # ============================================================================
 
 class SECFilingDownloader:
-    """Downloads SEC filings using pluggable strategy."""
+    """Downloads SEC filings using pluggable strategy pattern.
     
-    def __init__(self, strategy: FilingDownloaderStrategy, 
-                 http_client: HTTPClient, config: SECConfig, output_dir: str = "sec_filings"):
+    Responsibilities:
+    - Fetch list of available filings from SEC API
+    - Apply filters via strategy
+    - Download files for each filing
+    - Manage rate limiting
+    """
+    
+    def __init__(self, strategy: DownloaderStrategy, config: SECConfig, output_dir: str = "sec_filings"):
         self.strategy = strategy
-        self.http_client = http_client
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
     
     def download(self, cik: str, form_type: str, num_reports: int = 5) -> List[str]:
-        """Download filings for specified CIK."""
+        """Download filings for specified CIK.
+        
+        Args:
+            cik: Central Index Key (company identifier)
+            form_type: Form type to download (e.g., "13F-HR", "NPORT-P")
+            num_reports: Maximum number of filings to download
+            
+        Returns:
+            List of paths to downloaded filing directories
+        """
+        # Normalize CIK to 10 digits with leading zeros
         cik = cik.strip().replace('-', '').zfill(10)
+        log(f"Fetching {form_type} filings for CIK {cik}...", VerbosityLevel.NORMAL, self.config)
         
-        print(f"Fetching {form_type} filings for CIK {cik}...")
-        
-        # Get filing list
         filings = self._fetch_filing_list(cik, form_type)
-        
         if not filings:
-            print(f"No {form_type} filings found")
+            log(f"No {form_type} filings found", VerbosityLevel.NORMAL, self.config)
             return []
         
-        print(f"Found {len(filings)} {form_type} filing(s), checking filters...")
+        log(f"Found {len(filings)} filing(s), checking filters...", VerbosityLevel.NORMAL, self.config)
         
-        # Download filings that pass filter
-        downloaded_paths = []
+        # Download filings that pass strategy's filter
+        downloaded = []
         for filing in filings:
-            if len(downloaded_paths) >= num_reports:
+            if len(downloaded) >= num_reports:
                 break
             
             archive_url = filing.archive_url(self.config.base_url)
             
             if not self.strategy.should_download(filing, archive_url):
-                print(f"  Skipping {filing.filing_date} (filter)")
+                log(f"Skipping {filing.filing_date} (filter)", VerbosityLevel.VERBOSE, self.config, "  ")
                 continue
             
             path = self._download_filing(filing, archive_url)
             if path:
-                downloaded_paths.append(path)
+                downloaded.append(path)
             
             time.sleep(self.config.rate_limit_delay)
         
-        print(f"\n✓ Downloaded {len(downloaded_paths)} filing(s)")
-        return downloaded_paths
+        log(f"Downloaded {len(downloaded)} filing(s)", VerbosityLevel.NORMAL, self.config, "\n✓ ")
+        return downloaded
     
     def _fetch_filing_list(self, cik: str, form_type: str) -> List[FilingMetadata]:
-        """Fetch list of filings from SEC API."""
-        url = f"{self.config.data_url}/submissions/CIK{cik}.json"
-        
+        """Fetch list of filings from SEC submissions API."""
         try:
-            response = self.http_client.get(url)
-            data = response.json()
+            url = f"{self.config.data_url}/submissions/CIK{cik}.json"
+            log(f"Fetching filing list from {url}", VerbosityLevel.DEBUG, self.config, "  ")
             
+            data = self.strategy.http.get(url).json()
             filings = data.get("filings", {}).get("recent", {})
             
-            result = []
-            for i, form in enumerate(filings.get("form", [])):
-                if form == form_type:
-                    result.append(FilingMetadata(
-                        cik=cik,
-                        accession_number=filings["accessionNumber"][i],
-                        filing_date=filings["filingDate"][i],
-                        form_type=form
-                    ))
+            # Filter to requested form type
+            result = [FilingMetadata(cik, filings["accessionNumber"][i], filings["filingDate"][i], form_type)
+                     for i, form in enumerate(filings.get("form", [])) if form == form_type]
             
             return result
         except Exception as e:
             raise FilingNotFoundError(f"Failed to fetch filings: {e}")
     
     def _download_filing(self, filing: FilingMetadata, archive_url: str) -> Optional[str]:
-        """Download a single filing."""
+        """Download a single filing's files.
+        
+        Creates directory named: {cik}_{accession_no_dash}
+        Downloads all required files per strategy.
+        """
         filing_dir = self.output_dir / f"{filing.cik}_{filing.accession_no_dash}"
         filing_dir.mkdir(exist_ok=True)
         
-        print(f"\nDownloading {filing.filing_date} ({filing.accession_number})...")
-        print(f"  Archive URL: {archive_url}")
+        log(f"{filing.filing_date} ({filing.accession_number})", VerbosityLevel.NORMAL, self.config, "\n")
+        log(f"Archive URL: {archive_url}", VerbosityLevel.VERBOSE, self.config, "  ")
         
-        files = self.strategy.get_required_files(archive_url)
         downloaded = 0
-        
-        for filename in files:
+        for filename in self.strategy.get_files(archive_url):
             file_url = f"{archive_url}/{filename}"
-            print(f"  Fetching: {file_url}")
-            if self._download_file(file_url, filing_dir / filename):
-                print(f"    ✓ {filename}")
+            log(f"Downloading {file_url}", VerbosityLevel.DEBUG, self.config, "  ")
+            
+            try:
+                response = self.strategy.http.get(file_url)
+                (filing_dir / filename).write_bytes(response.content)
+                log(f"✓ {filename}", VerbosityLevel.NORMAL, self.config, "  ")
                 downloaded += 1
-            else:
-                print(f"    ✗ {filename} (failed)")
+            except Exception as e:
+                log(f"✗ {filename}: {e}", VerbosityLevel.VERBOSE, self.config, "  ")
+            
             time.sleep(self.config.request_delay)
         
         return str(filing_dir) if downloaded > 0 else None
-    
-    def _download_file(self, url: str, filepath: Path) -> bool:
-        """Download single file."""
-        try:
-            response = self.http_client.get(url)
-            filepath.write_bytes(response.content)
-            return True
-        except:
-            return False
 
-
-# ============================================================================
-# PARSER
-# ============================================================================
 
 class SECFilingParser:
-    """Parses SEC filings using pluggable strategy."""
+    """Parses SEC filings using pluggable strategy pattern.
     
-    def __init__(self, strategy: FilingParserStrategy):
+    Responsibilities:
+    - Parse metadata from primary_doc.xml
+    - Parse holdings data into DataFrame
+    - Convert dates for dictionary keys
+    """
+    
+    def __init__(self, strategy: ParserStrategy):
         self.strategy = strategy
     
     def parse_filing(self, filing_dir: str) -> Tuple[Dict, pd.DataFrame]:
-        """Parse single filing."""
-        filing_path = Path(filing_dir)
+        """Parse single filing directory.
         
-        metadata = self.strategy.parse_metadata(filing_path / "primary_doc.xml")
-        holdings = self.strategy.parse_holdings(filing_path)
-        
-        return metadata, holdings
+        Returns:
+            Tuple of (metadata_dict, holdings_dataframe)
+        """
+        path = Path(filing_dir)
+        return self.strategy.parse_metadata(path / "primary_doc.xml"), self.strategy.parse_holdings(path)
     
     def parse_multiple(self, filing_dirs: List[str]) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-        """Parse multiple filings."""
-        results = {}
+        """Parse multiple filings into dictionary keyed by (cik, period_date).
         
+        This structure allows easy lookup by date and handles multiple CIKs.
+        """
+        results = {}
         for filing_dir in filing_dirs:
             try:
                 metadata, holdings = self.parse_filing(filing_dir)
-                
                 cik = metadata.get('cik', 'unknown')
                 period_str = metadata.get('periodofreport', 'unknown')
                 
-                print(f"  Parsed: CIK={cik}, Period={period_str}, Holdings={len(holdings)}")
-                
                 try:
                     period_date = pd.to_datetime(period_str)
-                    print(f"  Date converted to: {period_date}")
+                    log(f"✓ {filing_dir}: CIK={cik}, Period={period_date.date()}, Holdings={len(holdings)}", 
+                        VerbosityLevel.NORMAL, self.strategy.config)
                 except Exception as e:
-                    print(f"  Warning: Could not parse date '{period_str}': {e}")
+                    log(f"Warning: Date parse error '{period_str}': {e}", 
+                        VerbosityLevel.VERBOSE, self.strategy.config, "  ")
                     period_date = pd.NaT
                 
-                key = (cik, period_date)
-                results[key] = (metadata, holdings)
-                print(f"✓ {filing_dir}: {len(holdings)} holdings")
+                results[(cik, period_date)] = (metadata, holdings)
             except Exception as e:
-                print(f"✗ {filing_dir}: {e}")
+                log(f"✗ {filing_dir}: {e}", VerbosityLevel.ERROR, self.strategy.config)
         
         return results
 
@@ -623,67 +705,115 @@ class SECFilingParser:
 # ============================================================================
 
 class SECFilingManager:
-    """Facade for SEC filing operations."""
+    """Facade providing simple interface for SEC filing operations.
+    
+    This is the main entry point for users of this module. It:
+    - Selects appropriate strategies based on form type
+    - Provides unified interface regardless of filing type
+    - Stores parsed filings for later retrieval
+    
+    Example:
+        manager = SECFilingManager(form_type="13F-HR", verbosity=VerbosityLevel.VERBOSE)
+        filings = manager.download_and_parse("0001037389", num_reports=5)
+    """
+    
+    # Strategy registry - add new form types here
+    STRATEGIES = {
+        '13F-HR': (Filing13FDownloader, Filing13FParser),
+        'NPORT-P': (FilingNPORTDownloader, FilingNPORTParser),
+        'NPORT-N': (FilingNPORTDownloader, FilingNPORTParser),
+    }
     
     def __init__(self, form_type: str = "13F-HR", series_id: Optional[str] = None,
-                 output_dir: str = "sec_filings", config: Optional[SECConfig] = None):
-        """Initialize with appropriate strategies for form type."""
+                 output_dir: str = "sec_filings", config: Optional[SECConfig] = None,
+                 verbosity: Optional[VerbosityLevel] = None):
+        """Initialize manager with appropriate strategies.
+        
+        Args:
+            form_type: Form type to download (e.g., "13F-HR", "NPORT-P")
+            series_id: Series ID for NPORT filings (optional)
+            output_dir: Directory to save downloaded files
+            config: Custom configuration (optional, defaults created if None)
+            verbosity: Output verbosity level (overrides config if provided)
+        """
+        if form_type not in self.STRATEGIES:
+            raise ValueError(f"Unsupported form type: {form_type}. Supported: {list(self.STRATEGIES.keys())}")
+        
         self.form_type = form_type
-        self.series_id = series_id
         self.config = config or SECConfig()
         
-        # Create shared dependencies
-        http_client = DefaultHTTPClient(self.config)
-        xml_parser = XMLParser()
+        # Allow verbosity override without creating new config
+        if verbosity is not None:
+            self.config.verbosity = verbosity
         
-        # Create strategies based on form type
-        if form_type == "13F-HR":
-            file_discoverer = FilingFileDiscoverer(http_client, self.config)
-            download_strategy = Filing13FDownloaderStrategy(http_client, self.config, file_discoverer)
-            parse_strategy = Filing13FParserStrategy(xml_parser)
-        elif form_type in ["NPORT-P", "NPORT-N"]:
-            download_strategy = FilingNPORTDownloaderStrategy(http_client, self.config, series_id)
-            parse_strategy = FilingNPORTParserStrategy(xml_parser)
+        # Create HTTP client and strategies
+        http_client = DefaultHTTPClient(self.config)
+        downloader_cls, parser_cls = self.STRATEGIES[form_type]
+        
+        # Create downloader strategy with appropriate parameters
+        if form_type in ['NPORT-P', 'NPORT-N']:
+            download_strategy = downloader_cls(http_client, self.config, series_id)
         else:
-            raise ValueError(f"Unsupported form type: {form_type}")
+            download_strategy = downloader_cls(http_client, self.config)
+        
+        parse_strategy = parser_cls(http_client, self.config)
         
         # Create composed objects
-        self.downloader = SECFilingDownloader(download_strategy, http_client, self.config, output_dir)
+        self.downloader = SECFilingDownloader(download_strategy, self.config, output_dir)
         self.parser = SECFilingParser(parse_strategy)
         self.filings = {}
     
     def download_and_parse(self, cik: str, num_reports: int = 5) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-        """Download and parse filings."""
+        """Download and parse filings in one operation.
+        
+        This is the main method for retrieving filing data.
+        
+        Returns:
+            Dictionary keyed by (cik, period_date) with values of (metadata, holdings_df)
+        """
         paths = self.downloader.download(cik, self.form_type, num_reports)
         self.filings = self.parser.parse_multiple(paths)
         return self.filings
     
     def get_filing_by_date(self, date_str: str) -> Tuple[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-        """Get filing by date."""
-        target_date = pd.to_datetime(date_str)
+        """Get filing by date from stored filings.
         
-        for key, value in self.filings.items():
-            cik, period_date = key
-            if pd.notna(period_date) and period_date.date() == target_date.date():
-                return (key, value)
-        
+        Args:
+            date_str: Date string in any pandas-parseable format (e.g., '2024-09-30')
+            
+        Returns:
+            Tuple of ((cik, period_date), (metadata, holdings_df))
+            
+        Raises:
+            KeyError: If no filing found for the given date
+        """
+        target = pd.to_datetime(date_str).date()
+        for (cik, period_date), value in self.filings.items():
+            if pd.notna(period_date) and period_date.date() == target:
+                return ((cik, period_date), value)
         raise KeyError(f"No filing found for date {date_str}")
 
 
 # ============================================================================
-# CONVENIENCE FUNCTIONS
+# CONVENIENCE FUNCTION
 # ============================================================================
 
-def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]], 
-                       date_str: str) -> Tuple[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
-    """Get filing by date from filings dictionary."""
-    target_date = pd.to_datetime(date_str)
+def get_filing_by_date(filings: Dict, date_str: str) -> Tuple:
+    """Get filing by date from filings dictionary.
     
-    for key, value in filings_dict.items():
-        cik, period_date = key
-        if pd.notna(period_date) and period_date.date() == target_date.date():
-            return (key, value)
+    Standalone function for when you have a filings dict but no manager instance.
     
+    Args:
+        filings: Dictionary returned by download_and_parse() or parse_multiple()
+        date_str: Date string to search for
+        
+    Returns:
+        Tuple of ((cik, period_date), (metadata, holdings_df))
+    """
+    target = pd.to_datetime(date_str).date()
+    for (cik, period_date), value in filings.items():
+        if pd.notna(period_date) and period_date.date() == target:
+            return ((cik, period_date), value)
     raise KeyError(f"No filing found for date {date_str}")
 
 
@@ -692,22 +822,41 @@ def get_filing_by_date(filings_dict: Dict[Tuple[str, pd.Timestamp], Tuple[Dict, 
 # ============================================================================
 
 if __name__ == "__main__":
-    # Example 1: 13-F filing
-    print("=" * 60)
+    # Example 1: 13-F filing with verbose output
     print("13-F: Renaissance Technologies")
     print("=" * 60)
-    manager_13f = SECFilingManager(form_type="13F-HR")
-    filings_13f = manager_13f.download_and_parse("0001037389", num_reports=2)
+    mgr = SECFilingManager(
+        form_type="13F-HR",
+        verbosity=VerbosityLevel.VERBOSE  # Show detailed progress
+    )
+    filings = mgr.download_and_parse("0001037389", num_reports=1)
     
-    # Example 2: NPORT-P with series ID
-    print("\n" + "=" * 60)
-    print("NPORT-P: Vanguard 500 Index Fund")
+    if filings:
+        key, (metadata, holdings) = list(filings.items())[0]
+        print(f"\nRetrieved {len(holdings)} holdings for {metadata.get('name')}")
+    
+    # Example 2: NPORT-P with series filtering and normal output
+    print("\n\nNPORT-P: Vanguard 500 Index Fund")
     print("=" * 60)
-    manager_nport = SECFilingManager(form_type="NPORT-P", series_id="S000002839")
-    filings_nport = manager_nport.download_and_parse("0000036405", num_reports=2)
+    mgr = SECFilingManager(
+        form_type="NPORT-P",
+        series_id="S000002839",  # Specific series
+        verbosity=VerbosityLevel.NORMAL  # Standard output
+    )
+    filings = mgr.download_and_parse("0000036405", num_reports=1)
     
-    if filings_nport:
-        key, (metadata, holdings) = list(filings_nport.items())[0]
-        print(f"\nResults:")
-        print(f"  Series: {metadata.get('name')}")
-        print(f"  Holdings: {len(holdings)}")
+    if filings:
+        key, (metadata, holdings) = list(filings.items())[0]
+        print(f"\nRetrieved {len(holdings)} holdings for {metadata.get('name')}")
+        print(f"Series ID: {metadata.get('seriesid')}")
+    
+    # Example 3: Silent mode (no output except errors)
+    print("\n\nSilent mode example:")
+    print("=" * 60)
+    mgr_silent = SECFilingManager(
+        form_type="13F-HR",
+        verbosity=VerbosityLevel.SILENT
+    )
+    # This will run with no output
+    filings_silent = mgr_silent.download_and_parse("0001037389", num_reports=1)
+    print(f"Downloaded {len(filings_silent)} filing(s) silently")
