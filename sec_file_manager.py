@@ -795,6 +795,168 @@ class SECFilingManager:
 
 
 # ============================================================================
+# LOCAL FILE PARSER
+# ============================================================================
+
+class LocalFileParser:
+    """Parse SEC filings from local XML files without downloading.
+    
+    Useful for:
+    - Analyzing previously downloaded filings
+    - Testing with sample files
+    - Batch processing existing archives
+    
+    Example:
+        parser = LocalFileParser(form_type="13F-HR")
+        
+        # Single file
+        metadata, holdings = parser.parse_file("path/to/filing_dir")
+        
+        # Multiple directories
+        results = parser.parse_directories(["dir1", "dir2", "dir3"])
+    """
+    
+    def __init__(self, form_type: str = "13F-HR", config: Optional[SECConfig] = None):
+        """Initialize parser for specified form type.
+        
+        Args:
+            form_type: Form type - "13F-HR", "NPORT-P", etc.
+            config: Optional config (uses default if None)
+        """
+        if form_type not in SECFilingManager.STRATEGIES:
+            raise ValueError(f"Unsupported form type: {form_type}")
+        
+        self.form_type = form_type
+        self.config = config or SECConfig(verbosity=VerbosityLevel.NORMAL)
+        
+        # Create parser strategy (no HTTP needed for local files)
+        http_client = DefaultHTTPClient(self.config)
+        _, parser_cls = SECFilingManager.STRATEGIES[form_type]
+        self.strategy = parser_cls(http_client, self.config)
+    
+    def parse_file(self, path: str) -> Tuple[Dict, pd.DataFrame]:
+        """Parse single filing directory.
+        
+        Args:
+            path: Path to filing directory containing XML files
+            
+        Returns:
+            Tuple of (metadata_dict, holdings_dataframe)
+        """
+        filing_path = Path(path)
+        if not filing_path.exists():
+            raise FileNotFoundError(f"Directory not found: {path}")
+        
+        log(f"Parsing {filing_path}", VerbosityLevel.VERBOSE, self.config)
+        
+        metadata = self.strategy.parse_metadata(filing_path / "primary_doc.xml")
+        holdings = self.strategy.parse_holdings(filing_path)
+        
+        log(f"✓ Found {len(holdings)} holdings", VerbosityLevel.NORMAL, self.config)
+        
+        return metadata, holdings
+    
+    def parse_files(self, paths: List[str]) -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
+        """Parse multiple filing directories.
+        
+        Args:
+            paths: List of paths to filing directories
+            
+        Returns:
+            Dictionary keyed by (cik, period_date)
+        """
+        results = {}
+        
+        for path in paths:
+            try:
+                metadata, holdings = self.parse_file(path)
+                
+                cik = metadata.get('cik', 'unknown')
+                period_str = metadata.get('periodofreport', 'unknown')
+                
+                try:
+                    period_date = pd.to_datetime(period_str)
+                except:
+                    period_date = pd.NaT
+                
+                results[(cik, period_date)] = (metadata, holdings)
+            except Exception as e:
+                log(f"✗ {path}: {e}", VerbosityLevel.ERROR, self.config)
+        
+        log(f"Parsed {len(results)} filing(s)", VerbosityLevel.NORMAL, self.config, "\n✓ ")
+        return results
+    
+    def parse_directory(self, directory: str, pattern: str = "*") -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
+        """Parse all filing subdirectories in a directory.
+        
+        Args:
+            directory: Parent directory containing filing subdirectories
+            pattern: Glob pattern for subdirectory names (default: "*")
+            
+        Returns:
+            Dictionary keyed by (cik, period_date)
+            
+        Example:
+            # Parse all filings in sec_filings/
+            results = parser.parse_directory("sec_filings")
+            
+            # Parse only specific CIK
+            results = parser.parse_directory("sec_filings", "0001037389_*")
+        """
+        dir_path = Path(directory)
+        if not dir_path.exists():
+            raise FileNotFoundError(f"Directory not found: {directory}")
+        
+        # Find all subdirectories matching pattern
+        subdirs = [str(p) for p in dir_path.glob(pattern) if p.is_dir()]
+        
+        if not subdirs:
+            log(f"No subdirectories found matching '{pattern}' in {directory}", 
+                VerbosityLevel.NORMAL, self.config)
+            return {}
+        
+        log(f"Found {len(subdirs)} filing(s) in {directory}", VerbosityLevel.NORMAL, self.config)
+        return self.parse_files(subdirs)
+    
+    def parse_directories(self, directories: List[str], pattern: str = "*") -> Dict[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
+        """Parse all filings from multiple parent directories.
+        
+        Args:
+            directories: List of parent directories
+            pattern: Glob pattern for subdirectory names
+            
+        Returns:
+            Dictionary keyed by (cik, period_date)
+            
+        Example:
+            results = parser.parse_directories([
+                "archive_2023",
+                "archive_2024",
+                "archive_2025"
+            ])
+        """
+        all_results = {}
+        
+        for directory in directories:
+            try:
+                results = self.parse_directory(directory, pattern)
+                all_results.update(results)
+            except Exception as e:
+                log(f"✗ {directory}: {e}", VerbosityLevel.ERROR, self.config)
+        
+        log(f"Total: {len(all_results)} filing(s) from {len(directories)} directories", 
+            VerbosityLevel.NORMAL, self.config, "\n✓ ")
+        return all_results
+    
+    def get_filing_by_date(self, filings: Dict, date_str: str) -> Tuple[Tuple[str, pd.Timestamp], Tuple[Dict, pd.DataFrame]]:
+        """Get filing by date from parsed filings.
+        
+        Convenience method that wraps the module-level function.
+        """
+        return get_filing_by_date(filings, date_str)
+
+
+# ============================================================================
 # CONVENIENCE FUNCTION
 # ============================================================================
 
