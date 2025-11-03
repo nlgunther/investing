@@ -7,15 +7,16 @@ Works with both file paths and IO streams.
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List, Union, BinaryIO
+from typing import Dict, Optional, List, Union, BinaryIO
 import pandas as pd
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from dataclasses import dataclass
+from io import BytesIO
 
 
 # ============================================================================
-# CONFIGURATION
+# SHARED TYPES & CONFIGURATION
 # ============================================================================
 
 class VerbosityLevel(IntEnum):
@@ -33,8 +34,8 @@ class ParseConfig:
     verbosity: VerbosityLevel = VerbosityLevel.NORMAL
 
 
-def log(message: str, level: VerbosityLevel, config: ParseConfig, prefix: str = ""):
-    """Centralized logging function."""
+def _log(message: str, level: VerbosityLevel, config: ParseConfig, prefix: str = ""):
+    """Internal logging function."""
     if config.verbosity >= level:
         print(f"{prefix}{message}")
 
@@ -53,7 +54,11 @@ class ParseError(Exception):
 # ============================================================================
 
 class XMLParser:
-    """Utility class for XML parsing operations."""
+    """Utility class for XML parsing operations.
+    
+    All methods are static as this is a pure utility class with no state.
+    Handles namespace removal and hierarchical data extraction.
+    """
     
     @staticmethod
     def parse_stream(stream: BinaryIO) -> Optional[ET.Element]:
@@ -66,7 +71,7 @@ class XMLParser:
             Root element with namespaces removed, or None if invalid
         """
         try:
-            stream.seek(0)  # Reset stream position
+            stream.seek(0)  # Reset to beginning
             tree = ET.parse(stream)
             return XMLParser.remove_namespaces(tree.getroot())
         except ET.ParseError:
@@ -89,7 +94,11 @@ class XMLParser:
     
     @staticmethod
     def remove_namespaces(root: ET.Element) -> ET.Element:
-        """Remove XML namespaces from element tree."""
+        """Remove XML namespaces from element tree.
+        
+        SEC XML files use namespaces like xmlns="http://www.sec.gov/edgar/..."
+        This strips them for easier querying.
+        """
         for elem in root.iter():
             if '}' in elem.tag:
                 elem.tag = elem.tag.split('}', 1)[1]
@@ -103,25 +112,50 @@ class XMLParser:
             <parent><child>value</child></parent>
         To:
             {'parent_child': 'value'}
+        
+        This flattened structure makes it easy to access values without
+        navigating the XML tree structure.
         """
         data = {}
-        def traverse(element: ET.Element, path: List[str] = []):
+        
+        def traverse(element: ET.Element, path: List[str] = None):
+            if path is None:
+                path = []
+            
             for child in element:
-                tag = child.tag.split('}')[-1]
+                tag = child.tag.split('}')[-1]  # Remove namespace if present
                 key = '_'.join(path + [tag]).lower()
+                
                 if len(child) == 0 and child.text and child.text.strip():
+                    # Leaf node - store the value
                     data[key] = child.text.strip()
                 else:
+                    # Branch node - recurse
                     traverse(child, path + [tag])
+        
         traverse(root)
         return data
     
     @staticmethod
     def find_all(root: ET.Element, tag: str) -> List[ET.Element]:
-        """Find all elements with tag (namespace-agnostic)."""
-        return (root.findall(f'.//{{{root.tag.split("}")[0][1:]}}}{tag}') or
-                root.findall(f'.//{tag}') or
-                [e for e in root.findall('.//*') if e.tag.endswith(tag)])
+        """Find all elements with tag (namespace-agnostic).
+        
+        Tries multiple strategies to find elements regardless of namespace.
+        """
+        # Try with root's namespace
+        if '}' in root.tag:
+            namespace = root.tag.split('}')[0][1:]
+            result = root.findall(f'.//{{{namespace}}}{tag}')
+            if result:
+                return result
+        
+        # Try without namespace
+        result = root.findall(f'.//{tag}')
+        if result:
+            return result
+        
+        # Fallback: check tag endings
+        return [e for e in root.findall('.//*') if e.tag.endswith(tag)]
 
 
 # ============================================================================
@@ -130,7 +164,14 @@ class XMLParser:
 
 @dataclass
 class ParsingResult:
-    """Result of parsing a filing."""
+    """Result of parsing a filing.
+    
+    Attributes:
+        metadata: Dict of metadata fields (CIK, period, name, etc.)
+        holdings: DataFrame of holdings data
+        cik: Central Index Key (extracted for convenience)
+        period_date: Period date as pandas Timestamp (extracted for convenience)
+    """
     metadata: Dict[str, str]
     holdings: pd.DataFrame
     cik: str
@@ -142,7 +183,7 @@ class ParsingResult:
 # ============================================================================
 
 class ParseStrategy(ABC):
-    """Abstract parsing strategy."""
+    """Abstract parsing strategy defining interface for different filing types."""
     
     def __init__(self, config: ParseConfig):
         self.config = config
@@ -164,22 +205,30 @@ class ParseStrategy(ABC):
     
     @abstractmethod
     def get_aliases(self) -> Dict[str, str]:
-        """Get metadata field aliases."""
+        """Get metadata field aliases (short names for common fields)."""
         pass
     
     def _to_numeric(self, df: pd.DataFrame, patterns: List[str]) -> pd.DataFrame:
-        """Convert columns matching patterns to numeric types."""
+        """Convert columns matching patterns to numeric types.
+        
+        Shared utility method for all parsers. Silently ignores conversion errors.
+        """
         for col in df.columns:
             if any(p in col for p in patterns):
                 try:
                     df[col] = pd.to_numeric(df[col])
                 except (ValueError, TypeError):
-                    pass
+                    pass  # Keep as string if conversion fails
         return df
 
 
 class Parse13F(ParseStrategy):
-    """Parsing strategy for 13-F filings."""
+    """Parsing strategy for 13-F filings (hedge fund holdings).
+    
+    13-F structure:
+    - primary_doc.xml: Metadata (filer info, period, etc.)
+    - *_holdings.xml or infotable.xml: Holdings data (one infoTable per holding)
+    """
     
     def parse_metadata(self, stream: BinaryIO) -> Dict[str, str]:
         """Extract metadata from primary_doc.xml stream."""
@@ -188,15 +237,20 @@ class Parse13F(ParseStrategy):
             return {}
         
         metadata = self.xml.to_dict(root)
-        return {**metadata, **{alias: metadata.get(key, '') 
-                              for alias, key in self.get_aliases().items()}}
+        
+        # Add convenient aliases
+        aliases = {alias: metadata.get(key, '') 
+                  for alias, key in self.get_aliases().items()}
+        
+        return {**metadata, **aliases}
     
     def parse_holdings(self, streams: Dict[str, BinaryIO]) -> pd.DataFrame:
         """Parse holdings from separate holdings XML file.
         
         Searches for files with 'holding' in name or named 'infotable.xml'.
+        Each <infoTable> element represents one holding.
         """
-        # Find holdings file
+        # Find holdings file (naming varies by filer)
         holdings_stream = None
         for filename, stream in streams.items():
             if 'holding' in filename.lower() or filename == 'infotable.xml':
@@ -204,28 +258,32 @@ class Parse13F(ParseStrategy):
                 break
         
         if not holdings_stream:
-            log("No holdings file found", VerbosityLevel.VERBOSE, self.config, "    ")
+            _log("No holdings file found", VerbosityLevel.VERBOSE, self.config, "    ")
             return pd.DataFrame()
         
         root = self.xml.parse_stream(holdings_stream)
         if not root:
             return pd.DataFrame()
         
+        # Extract all infoTable elements (one per holding)
         holdings = [self.xml.to_dict(table) 
                    for table in self.xml.find_all(root, 'infoTable')]
+        
         if not holdings:
             return pd.DataFrame()
         
         df = pd.DataFrame(holdings)
         df = self._to_numeric(df, ['value', 'sshprnamt'])
         
+        # Calculate unit value (price per share) if possible
         if 'value' in df.columns and 'shrsorprnamt_sshprnamt' in df.columns:
-            df = df.assign(unitValue=lambda x: x['value'] / x['shrsorprnamt_sshprnamt'])
+            with pd.option_context('mode.chained_assignment', None):
+                df['unitValue'] = df['value'] / df['shrsorprnamt_sshprnamt']
         
         return df
     
     def get_aliases(self) -> Dict[str, str]:
-        """Map short names to full hierarchical keys."""
+        """Map short names to full hierarchical keys for 13-F metadata."""
         return {
             'cik': 'headerdata_filerinfo_filer_credentials_cik',
             'periodofreport': 'headerdata_filerinfo_periodofreport',
@@ -234,7 +292,13 @@ class Parse13F(ParseStrategy):
 
 
 class ParseNPORT(ParseStrategy):
-    """Parsing strategy for NPORT filings."""
+    """Parsing strategy for NPORT filings (mutual fund holdings).
+    
+    NPORT structure (single file):
+    - primary_doc.xml contains both metadata and holdings
+    - Metadata in <headerData> and <genInfo> sections
+    - Holdings in <invstOrSecs> section (one <invstOrSec> per holding)
+    """
     
     def parse_metadata(self, stream: BinaryIO) -> Dict[str, str]:
         """Extract metadata from primary_doc.xml stream."""
@@ -243,11 +307,18 @@ class ParseNPORT(ParseStrategy):
             return {}
         
         metadata = self.xml.to_dict(root)
-        return {**metadata, **{alias: metadata.get(key, '') 
-                              for alias, key in self.get_aliases().items()}}
+        
+        # Add convenient aliases
+        aliases = {alias: metadata.get(key, '') 
+                  for alias, key in self.get_aliases().items()}
+        
+        return {**metadata, **aliases}
     
     def parse_holdings(self, streams: Dict[str, BinaryIO]) -> pd.DataFrame:
-        """Parse holdings from primary_doc.xml (single file structure)."""
+        """Parse holdings from primary_doc.xml (single file structure).
+        
+        Each <invstOrSec> element represents one security holding.
+        """
         primary_stream = streams.get('primary_doc.xml')
         if not primary_stream:
             return pd.DataFrame()
@@ -256,23 +327,27 @@ class ParseNPORT(ParseStrategy):
         if not root:
             return pd.DataFrame()
         
+        # Extract all invstOrSec elements
         holdings = [self.xml.to_dict(sec) 
                    for sec in self.xml.find_all(root, 'invstOrSec')]
+        
         if not holdings:
-            log("No holdings found in invstOrSecs section", 
+            _log("No holdings found in invstOrSecs section", 
                 VerbosityLevel.VERBOSE, self.config, "    ")
             return pd.DataFrame()
         
         df = pd.DataFrame(holdings)
         df = self._to_numeric(df, ['valusd', 'balance', 'pctval'])
         
+        # Calculate unit value (price per unit) if possible
         if 'valusd' in df.columns and 'balance' in df.columns:
-            df = df.assign(unitValue=lambda x: x['valusd'] / x['balance'])
+            with pd.option_context('mode.chained_assignment', None):
+                df['unitValue'] = df['valusd'] / df['balance']
         
         return df
     
     def get_aliases(self) -> Dict[str, str]:
-        """Map short names to full hierarchical keys."""
+        """Map short names to full hierarchical keys for NPORT metadata."""
         return {
             'cik': 'headerdata_filerinfo_filer_issuercredentials_cik',
             'periodofreport': 'formdata_geninfo_reppddate',
@@ -286,8 +361,15 @@ class ParseNPORT(ParseStrategy):
 # ============================================================================
 
 class SECParser:
-    """Parses SEC filings from streams or files."""
+    """Parses SEC filings from streams or files.
     
+    Features:
+    - Works with IO streams (from downloader) or local files
+    - Pluggable strategies for different filing types
+    - Returns structured ParsingResult objects
+    """
+    
+    # Registry of supported form types
     STRATEGIES = {
         '13F-HR': Parse13F,
         'NPORT-P': ParseNPORT,
@@ -299,15 +381,18 @@ class SECParser:
         
         Args:
             form_type: Form type (e.g., "13F-HR", "NPORT-P")
-            config: Parse configuration
+            config: Parse configuration (uses defaults if None)
         """
         if form_type not in self.STRATEGIES:
-            raise ValueError(f"Unsupported form type: {form_type}. "
-                           f"Supported: {list(self.STRATEGIES.keys())}")
+            raise ValueError(
+                f"Unsupported form type: {form_type}. "
+                f"Supported: {', '.join(self.STRATEGIES.keys())}"
+            )
         
         self.form_type = form_type
         self.config = config or ParseConfig()
         
+        # Create appropriate strategy
         strategy_cls = self.STRATEGIES[form_type]
         self.strategy = strategy_cls(self.config)
     
@@ -315,10 +400,16 @@ class SECParser:
         """Parse filing from streams.
         
         Args:
-            streams: Dict of filename -> stream
+            streams: Dict of filename -> stream (e.g., from downloader)
             
         Returns:
             ParsingResult with metadata and holdings DataFrame
+            
+        Example:
+            parser = SECParser("13F-HR")
+            result = parser.parse_streams(filing_result.files)
+            print(f"CIK: {result.cik}")
+            print(f"Holdings: {len(result.holdings)}")
         """
         # Parse metadata from primary_doc.xml
         primary_stream = streams.get('primary_doc.xml')
@@ -328,18 +419,19 @@ class SECParser:
         metadata = self.strategy.parse_metadata(primary_stream)
         holdings = self.strategy.parse_holdings(streams)
         
-        # Extract key fields
+        # Extract key fields for convenience
         cik = metadata.get('cik', 'unknown')
         period_str = metadata.get('periodofreport', 'unknown')
         
+        # Parse period date
         try:
             period_date = pd.to_datetime(period_str)
-        except:
-            log(f"Warning: Could not parse date '{period_str}'", 
+        except Exception:
+            _log(f"Warning: Could not parse date '{period_str}'", 
                 VerbosityLevel.VERBOSE, self.config)
             period_date = pd.NaT
         
-        log(f"✓ Parsed: CIK={cik}, Period={period_date.date() if pd.notna(period_date) else 'unknown'}, "
+        _log(f"✓ Parsed: CIK={cik}, Period={period_date.date() if pd.notna(period_date) else 'unknown'}, "
             f"Holdings={len(holdings)}", VerbosityLevel.NORMAL, self.config)
         
         return ParsingResult(
@@ -357,6 +449,10 @@ class SECParser:
             
         Returns:
             ParsingResult with metadata and holdings DataFrame
+            
+        Example:
+            parser = SECParser("13F-HR")
+            result = parser.parse_directory("sec_filings/0001037389_xxx")
         """
         dir_path = Path(directory)
         if not dir_path.exists():
@@ -366,34 +462,45 @@ class SECParser:
         streams = {}
         for xml_file in dir_path.glob("*.xml"):
             with open(xml_file, 'rb') as f:
-                from io import BytesIO
                 streams[xml_file.name] = BytesIO(f.read())
         
         if not streams:
             raise ParseError(f"No XML files found in {directory}")
         
-        log(f"Parsing {directory}", VerbosityLevel.VERBOSE, self.config)
+        _log(f"Parsing {directory}", VerbosityLevel.VERBOSE, self.config)
         return self.parse_streams(streams)
     
-    def parse_multiple_directories(self, directories: List[Union[str, Path]]) -> Dict[Tuple[str, pd.Timestamp], ParsingResult]:
+    def parse_multiple_directories(self, 
+                                   directories: List[Union[str, Path]]) -> Dict[tuple, ParsingResult]:
         """Parse multiple filing directories.
         
         Args:
             directories: List of directory paths
             
         Returns:
-            Dictionary keyed by (cik, period_date)
+            Dictionary keyed by (cik, period_date) containing ParsingResult objects
+            
+        Example:
+            parser = SECParser("13F-HR")
+            results = parser.parse_multiple_directories([
+                "sec_filings/filing1",
+                "sec_filings/filing2"
+            ])
+            for (cik, date), result in results.items():
+                print(f"{cik} - {date}: {len(result.holdings)} holdings")
         """
         results = {}
         
         for directory in directories:
             try:
                 result = self.parse_directory(directory)
-                results[(result.cik, result.period_date)] = result
+                key = (result.cik, result.period_date)
+                results[key] = result
+                
             except Exception as e:
-                log(f"✗ {directory}: {e}", VerbosityLevel.ERROR, self.config)
+                _log(f"✗ {directory}: {e}", VerbosityLevel.ERROR, self.config)
         
-        log(f"\n✓ Parsed {len(results)} filing(s)", VerbosityLevel.NORMAL, self.config)
+        _log(f"\n✓ Parsed {len(results)} filing(s)", VerbosityLevel.NORMAL, self.config)
         return results
 
 
@@ -404,25 +511,47 @@ class SECParser:
 if __name__ == "__main__":
     from io import BytesIO
     
-    # Example 1: Parse from streams (as returned by downloader)
-    print("Example 1: Parse from streams")
+    print("SEC Parser Module")
     print("=" * 60)
+    print("\nThis module parses SEC filings from streams or local files.")
+    print("\nExample 1: Parse from streams (as returned by downloader)")
+    print("-" * 60)
+    print("""
+    from sec_downloader import SECDownloader
+    from sec_parser import SECParser
     
-    # Simulate streams from downloader
-    example_streams = {
-        'primary_doc.xml': BytesIO(b'<xml>...</xml>'),  # Would be actual XML
-    }
+    # Download filing
+    downloader = SECDownloader("13F-HR")
+    results = downloader.download("0001037389", num_reports=1)
     
-    parser = SECParser("13F-HR", config=ParseConfig(verbosity=VerbosityLevel.NORMAL))
-    # result = parser.parse_streams(example_streams)  # Would work with real XML
+    # Parse from streams
+    parser = SECParser("13F-HR")
+    parsed = parser.parse_streams(results[0].files)
     
-    # Example 2: Parse from local directory
-    print("\n\nExample 2: Parse from local directory")
-    print("=" * 60)
+    print(f"CIK: {parsed.cik}")
+    print(f"Period: {parsed.period_date}")
+    print(f"Holdings: {len(parsed.holdings)}")
+    """)
     
-    parser = SECParser("13F-HR", config=ParseConfig(verbosity=VerbosityLevel.VERBOSE))
-    # result = parser.parse_directory("sec_filings/0001037389_0001037389240001234")
-    # print(f"\nMetadata keys: {list(result.metadata.keys())[:5]}...")
-    # print(f"Holdings shape: {result.holdings.shape}")
+    print("\nExample 2: Parse from local directory")
+    print("-" * 60)
+    print("""
+    parser = SECParser("13F-HR")
+    result = parser.parse_directory("sec_filings/0001037389_xxx")
     
-    print("\nParser module ready. Use with real XML files or streams from downloader.")
+    print(f"Metadata keys: {list(result.metadata.keys())[:5]}")
+    print(f"Holdings shape: {result.holdings.shape}")
+    """)
+    
+    print("\nExample 3: Parse multiple directories")
+    print("-" * 60)
+    print("""
+    parser = SECParser("13F-HR")
+    results = parser.parse_multiple_directories([
+        "sec_filings/filing1",
+        "sec_filings/filing2"
+    ])
+    
+    for (cik, date), result in results.items():
+        print(f"{cik} - {date}: {len(result.holdings)} holdings")
+    """)
