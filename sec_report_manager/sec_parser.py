@@ -7,13 +7,40 @@ Works with both file paths and IO streams.
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, Optional, List, Union, BinaryIO
+from typing import Dict, Optional, List, Union, BinaryIO, Callable
 import pandas as pd
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from dataclasses import dataclass
 from io import BytesIO
+from itertools import groupby
 
+
+# ============================================================================
+# CONVENIENCE FUNCTIONS
+# ============================================================================
+
+def unique_sorted_by_key(objs, f=lambda x: x) -> tuple:
+    """
+    Returns a tuple:
+        (sorted_objects, unique_sorted_attribute_values)
+    """
+    # 1. Sort the objects once (O(n log n))
+    sorted_objs = sorted(objs, key=f)
+
+    # 2. Pull the unique attribute values while preserving order
+    uniq_vals = [key for key, _ in groupby(sorted_objs, key=f)]
+
+    return sorted_objs, uniq_vals
+
+# def unique_sorted(lst): OLD
+#     if not lst:
+#         return []
+#     result = [lst[0]]
+#     for item in lst[1:]:
+#         if item != result[-1]:
+#             result.append(item)
+#     return result
 
 # ============================================================================
 # SHARED TYPES & CONFIGURATION
@@ -176,6 +203,85 @@ class ParsingResult:
     holdings: pd.DataFrame
     cik: str
     period_date: pd.Timestamp
+
+from typing import List, Optional
+import pandas as pd
+from dataclasses import dataclass
+
+@dataclass
+class ParsingResult:
+    metadata: Dict[str, str]
+    holdings: pd.DataFrame
+    cik: str
+    period_date: pd.Timestamp
+
+
+class ParsingResultManager:
+    """Manages sorting and filtering of ParsingResult objects by metadata dates."""
+    
+    def __init__(self, results: List[ParsingResult],
+                 date_key: str = 'filing_date',
+                 extracter: Callable = lambda obj, key: obj.metadata[key]):
+        """
+        Initialize manager with results sorted by specified metadata date key.
+        A fast method using pre-sorting and grouping.
+        Args:
+            results: List of ParsingResult objects
+            date_key: Metadata key containing the date string for sorting
+        """
+        self.date_key = date_key # must be first as used in get_date
+        self.extracter = extracter
+        self.results, self.dates = unique_sorted_by_key(results,self.get_date)
+    
+    def get_date(self, result: ParsingResult) -> pd.Timestamp:
+        """Extract and parse date from a result's metadata, converting 
+        the day to the first day of the month."""
+
+        return pd.to_datetime(self.extracter(result,self.date_key)).replace(day=1)
+    
+    def by_rank(self, rank: int = -1) -> List[ParsingResult]:
+        """
+        Get all results matching the date at the specified rank.
+        
+        Args:
+            rank: -1 for most recent, 0 for earliest, -2 for 2nd most recent, etc.
+        
+        Returns:
+            List of results with the date at that rank, or empty list if out of bounds.
+        """
+        if not self.results:
+            return []
+        
+        try:
+            target_date = self.dates[rank]
+            return [r for r in self.results if self.get_date(r) == target_date]
+        except IndexError:
+            return []
+    
+    def by_date_range(
+        self, 
+        start: Optional[pd.Timestamp] = None, 
+        end: Optional[pd.Timestamp] = None
+    ) -> List[ParsingResult]:
+        """Filter results by date range (inclusive on both ends)."""
+        filtered = self.results
+        if start:
+            filtered = [r for r in filtered if self.get_date(r) >= start]
+        if end:
+            filtered = [r for r in filtered if self.get_date(r) <= end]
+        return filtered
+
+
+# Usage:
+# manager = ParsingResultManager(results_list)
+# most_recent = manager.by_rank(-1)
+# earliest = manager.by_rank(0)
+# second_oldest = manager.by_rank(1)
+# in_range = manager.by_date_range(start_date, end_date)
+# 
+# Or use Python's built-in filter:
+# by_cik = [r for r in manager.results if r.cik == '0001234567']
+
 
 
 # ============================================================================
@@ -441,7 +547,8 @@ class SECParser:
             period_date=period_date
         )
     
-    def parse_directory(self, directory: Union[str, Path]) -> ParsingResult:
+    def parse_directory(self, directory: Union[str, Path],
+                        globex = '*.xml') -> ParsingResult:
         """Parse filing from local directory.
         
         Args:
@@ -460,7 +567,7 @@ class SECParser:
         
         # Load all XML files into streams
         streams = {}
-        for xml_file in dir_path.glob("*.xml"):
+        for xml_file in dir_path.glob(globex):
             with open(xml_file, 'rb') as f:
                 streams[xml_file.name] = BytesIO(f.read())
         
@@ -471,7 +578,8 @@ class SECParser:
         return self.parse_streams(streams)
     
     def parse_multiple_directories(self, 
-                                   directories: List[Union[str, Path]]) -> Dict[tuple, ParsingResult]:
+                                   directories: List[Union[str, Path]],
+                                   globex = '*.xml') -> Dict[tuple, ParsingResult]:
         """Parse multiple filing directories.
         
         Args:
@@ -493,7 +601,7 @@ class SECParser:
         
         for directory in directories:
             try:
-                result = self.parse_directory(directory)
+                result = self.parse_directory(directory,globex)
                 key = (result.cik, result.period_date)
                 results[key] = result
                 

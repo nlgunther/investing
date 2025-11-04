@@ -10,8 +10,8 @@ import pandas as pd
 from pathlib import Path
 from enum import Enum
 
-from sec_downloader import SECDownloader, DownloadConfig, VerbosityLevel as DownloadVerbosity
-from sec_parser import SECParser, ParseConfig, ParsingResult, VerbosityLevel as ParseVerbosity
+from .sec_downloader import SECDownloader, DownloadConfig, VerbosityLevel as DownloadVerbosity
+from .sec_parser import SECParser, ParseConfig, ParsingResult, VerbosityLevel as ParseVerbosity
 
 
 # ============================================================================
