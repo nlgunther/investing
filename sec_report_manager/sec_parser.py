@@ -14,6 +14,7 @@ from enum import IntEnum
 from dataclasses import dataclass
 from io import BytesIO
 from itertools import groupby
+import re
 
 
 # ============================================================================
@@ -359,7 +360,9 @@ class Parse13F(ParseStrategy):
         # Find holdings file (naming varies by filer)
         holdings_stream = None
         for filename, stream in streams.items():
-            if 'holding' in filename.lower() or filename == 'infotable.xml':
+            if 'primary' not in filename.lower():
+            # if re.search('holding|infotable|informationtable',filename.lower()):
+            # if 'holding' in filename.lower() or filename == 'infotable.xml':
                 holdings_stream = stream
                 break
         
@@ -579,11 +582,16 @@ class SECParser:
     
     def parse_multiple_directories(self, 
                                    directories: List[Union[str, Path]],
-                                   globex = '*.xml') -> Dict[tuple, ParsingResult]:
+                                   globex = '*.xml',
+                                   make_custom_key: Optional[Callable] = None,
+                                   make_custom_tag: Optional[Callable] = None) -> Dict[tuple, ParsingResult]:
         """Parse multiple filing directories.
         
         Args:
             directories: List of directory paths
+            globex: Glob pattern to match XML files
+            make_custom_key: Optional function to create custom keys for results
+            make_custom_tag: Optional function to create custom tags for results
             
         Returns:
             Dictionary keyed by (cik, period_date) containing ParsingResult objects
@@ -602,9 +610,9 @@ class SECParser:
         for directory in directories:
             try:
                 result = self.parse_directory(directory,globex)
-                key = (result.cik, result.period_date)
-                results[key] = result
-                
+                # simple hack to allow custom keys and tags
+                key = directory if make_custom_key is None else make_custom_key(result)
+                results[key] = result if make_custom_tag is None else (make_custom_tag(result), result)
             except Exception as e:
                 _log(f"✗ {directory}: {e}", VerbosityLevel.ERROR, self.config)
         
